@@ -42,15 +42,36 @@ def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
 
     result = mlx_whisper.transcribe(
         samples, path_or_hf_repo=model, language="zh", word_timestamps=True,
-        initial_prompt=prompt, verbose=None, condition_on_previous_text=False,
+        initial_prompt=prompt or None, verbose=None, condition_on_previous_text=False,
+        compression_ratio_threshold=1.8,  # 比默认 2.4 严，更早触发温度回退，压住重复死循环
     )
     words = [w for seg in result.get("segments", []) for w in seg.get("words", [])]
     return result.get("text", "").strip(), words
 
 
+def _looks_hallucinated(spoken: str, heard: str) -> bool:
+    """Whisper 的重复死循环或乱码：听写比稿子长很多，或者和稿子几乎对不上。"""
+    a = sum(1 for c in spoken if textalign.is_content(c))
+    b = sum(1 for c in heard if textalign.is_content(c))
+    if b > 1.4 * a + 4:
+        return True
+    d = textalign.diff(spoken, heard)
+    missing = sum(len(x) for x in d.missing)
+    return missing > 0.4 * a
+
+
 def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, transcriber) -> tuple[str, list[dict]]:
-    """听写一句；逐字时间戳没覆盖到句尾时（Whisper 偶尔在半个多字节字符处断掉），从断点往后补听，最多补两次。"""
-    heard_text, words = transcriber(slice_16k(wav, s0, s1), spoken, model)
+    """听写一句；逐字时间戳没覆盖到句尾时（Whisper 偶尔在半个多字节字符处断掉），从断点往后补听，最多补两次。
+
+    听写像是幻觉（重复死循环、乱码）时，去掉提示词再听一遍，取和稿子更接近的那次。
+    """
+    samples = slice_16k(wav, s0, s1)
+    heard_text, words = transcriber(samples, spoken, model)
+    if _looks_hallucinated(spoken, heard_text):
+        retry_text, retry_words = transcriber(samples, "", model)
+        if textalign.align(spoken, textalign.chars_from_words(retry_words)).ratio > \
+                textalign.align(spoken, textalign.chars_from_words(words)).ratio:
+            heard_text, words = retry_text, retry_words
     for _ in range(2):
         last = max((w["end"] for w in words), default=0.0)
         if s0 + last >= s1 - 0.6:
