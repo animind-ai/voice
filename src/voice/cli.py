@@ -53,8 +53,12 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["GEMINI_TTS_VOICE"] = voice
         speed = args.speed or float(voice_style.get("speed", 1.0))
         args.out.mkdir(parents=True, exist_ok=True)
+        log_path = args.out / "tts_usage.jsonl"
+        before = synth.total_cost(log_path)
         for beat in beats:
             synth.synth_beat(beat, args.out, voice_style.get("persona", "teacher-hs"), model, voice, speed)
+        after = synth.total_cost(log_path)
+        print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
         return 0
 
     from . import align
@@ -65,7 +69,8 @@ def main(argv: list[str] | None = None) -> int:
         for r in results:
             if r.flagged:
                 flagged += 1
-                print(f"  ⚠ {beat.id}[{r.key}] 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}\n    听到：{r.heard}")
+                sure = f"；复核仍缺 {r.confirmed}" if r.confirmed else "（没有原始单句音频，未复核）"
+                print(f"  ⚠ {beat.id}[{r.key}] 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}{sure}\n    听到：{r.heard}")
     print(f"完成；需要回听 {flagged} 句")
     return 0
 

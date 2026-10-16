@@ -31,6 +31,11 @@ PACE = {
     "ask": "带着设问的语气，像在引导学生一起想，问句尾音上扬。",
 }
 GAP = {"normal": 0.35, "brisk": 0.25, "slow": 0.6, "ask": 0.55}
+# 单价（美元）：OpenRouter 上 google/gemini-3.8-flash-tts 输入 $0.5/百万 token、输出 $9/百万 token；
+# Gemini 音频输出按 25 token/秒计，约 $0.0135/分钟。价格变了就改这里。
+PRICE_INPUT_PER_TOKEN = 0.5e-6
+PRICE_OUTPUT_PER_TOKEN = 9e-6
+AUDIO_TOKENS_PER_SECOND = 25
 LEAD = 0.3
 RATE = 22050
 
@@ -124,8 +129,35 @@ def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
         return wav
     _to_wav(speak(instructions, text, model), wav)
     stamp_path.write_text(json.dumps(stamp, ensure_ascii=False), encoding="utf-8")
-    log(f"  合成 {name} {wav_seconds(wav):.1f}s")
+    seconds = wav_seconds(wav)
+    cost = log_usage(lines_dir.parent / "tts_usage.jsonl", name, model, text, instructions, seconds)
+    log(f"  合成 {name} {seconds:.1f}s，约 ${cost:.4f}")
     return wav
+
+
+def estimate_cost(text: str, instructions: str, seconds: float) -> float:
+    input_tokens = (len(text) + len(instructions)) * 1.5  # 粗估：中文约 1–2 token/字
+    return input_tokens * PRICE_INPUT_PER_TOKEN + seconds * AUDIO_TOKENS_PER_SECOND * PRICE_OUTPUT_PER_TOKEN
+
+
+def log_usage(path: Path, name: str, model: str, text: str, instructions: str, seconds: float) -> float:
+    """每次真实调用 TTS 追加一行用量记录，返回估算费用（美元）。"""
+    import datetime
+
+    cost = estimate_cost(text, instructions, seconds)
+    record = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "line": name, "model": model,
+              "chars": len(text), "seconds": round(seconds, 2), "est_usd": round(cost, 6)}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return cost
+
+
+def total_cost(path: Path) -> tuple[int, float]:
+    """用量记录里的调用次数和估算总费用。"""
+    if not path.exists():
+        return 0, 0.0
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return len(rows), sum(r.get("est_usd", 0.0) for r in rows)
 
 
 def synth_beat(beat: Beat, out_dir: Path, persona: str, model: str, voice: str, speed: float = 1.0,

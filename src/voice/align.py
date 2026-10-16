@@ -30,11 +30,19 @@ class SentenceResult:
     heard: str = ""
     missing: list[str] = field(default_factory=list)
     extra: list[str] = field(default_factory=list)
+    confirmed: list[str] | None = None  # 复核后仍然缺的字；None 表示没复核
+
+    @property
+    def suspicious(self) -> bool:
+        """第一遍听写对不上：匹配率低，或者漏了 / 多了两个字以上的片段。"""
+        return self.ratio < 0.85 or any(len(s) >= 2 for s in self.missing + self.extra)
 
     @property
     def flagged(self) -> bool:
-        """需要人去听：匹配率低，或者漏了 / 多了两个字以上的片段。"""
-        return self.ratio < 0.85 or any(len(s) >= 2 for s in self.missing + self.extra)
+        """需要人去听：第一遍可疑，并且复核后仍有缺字（没有原始单句音频可复核时，按第一遍算）。"""
+        if not self.suspicious:
+            return False
+        return bool(self.confirmed) if self.confirmed is not None else True
 
 
 def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
@@ -115,6 +123,21 @@ def align_sentence(sentence: Sentence, wav: Path, start: float, end: float, mode
     return res
 
 
+def confirm(sentence: Sentence, raw_wav: Path, model: str, transcriber=transcribe) -> list[str]:
+    """在未变速的原始单句音频上，不带提示词、带提示词各听一次；两次都没听到的字才算确认缺失。
+
+    第一遍是在拼好（可能变速）的 beat 音频上、带稿子作提示词听的，两种条件都会让 Whisper 听错：
+    变速让字更难辨认，提示词会把它往稿子上带，也可能带偏。
+    """
+    samples = slice_16k(raw_wav, 0.0, 600.0)
+    heard_plain, _ = transcriber(samples, "", model)
+    heard_prompted, _ = transcriber(samples, sentence.spoken, model)
+    gone_a = set("".join(textalign.diff(sentence.spoken, heard_plain).missing))
+    gone_b = set("".join(textalign.diff(sentence.spoken, heard_prompted).missing))
+    both = gone_a & gone_b
+    return [m for m in textalign.diff(sentence.spoken, heard_prompted).missing if set(m) & both]
+
+
 def align_beat(beat: Beat, audio_dir: Path, model: str = DEFAULT_MODEL, transcriber=transcribe, log=print) -> list[SentenceResult]:
     timing_path = audio_dir / f"{beat.id}.timing.json"
     wav = audio_dir / f"{beat.id}.wav"
@@ -128,9 +151,14 @@ def align_beat(beat: Beat, audio_dir: Path, model: str = DEFAULT_MODEL, transcri
         raise ValueError(f"{timing_path.name} 有 {len(cues)} 句，scene 里 {beat.id} 有 {len(beat.sentences)} 句；稿子改过就要重新 synth")
     results = []
     for sentence, cue in zip(beat.sentences, cues):
-        results.append(align_sentence(sentence, wav, cue["start"], cue["end"], model, transcriber))
+        r = align_sentence(sentence, wav, cue["start"], cue["end"], model, transcriber)
+        raw = audio_dir / "lines" / f"{beat.id}-{sentence.index}.wav"
+        if r.suspicious and raw.exists():
+            r.confirmed = confirm(sentence, raw, model, transcriber)
+        results.append(r)
     timing["marks"] = {r.key: r.marks for r in results if r.marks}
-    timing["check"] = {r.key: {"ratio": r.ratio, "missing": r.missing, "extra": r.extra, "heard": r.heard} for r in results}
+    timing["check"] = {r.key: {"ratio": r.ratio, "missing": r.missing, "extra": r.extra, "heard": r.heard,
+                               "confirmed": r.confirmed} for r in results}
     timing["aligner"] = model
     timing_path.write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
     flagged = [r.key for r in results if r.flagged]

@@ -109,3 +109,23 @@ def test_cli_align_requires_audio(tmp_path):
         assert "synth" in str(exc)
     else:
         raise AssertionError("缺少音频时应报错")
+
+
+def test_usage_is_logged_with_cost(tmp_path):
+    beat = script.beats({"beats": [{"id": "B", "say": [{"pace": "normal", "text": "一句话"}]}]})[0]
+    synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=lambda *a: tone(2.0), log=lambda *_: None)
+    calls, usd = synth.total_cost(tmp_path / "tts_usage.jsonl")
+    assert calls == 1 and 0.0003 < usd < 0.002  # 2 秒音频约 $0.00045，加上输入 token
+
+
+def test_confirm_drops_whisper_only_misses(tmp_path):
+    beat = script.beats({"beats": [{"id": "B", "say": [{"pace": "normal", "text": "后面省略而且"}]}]})[0]
+    synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=lambda *a: tone(1.5), log=lambda *_: None)
+    raw = tmp_path / "lines" / "B-0.wav"
+    # 不带提示词时漏了"后面"，带提示词时听全了 → 不算确认缺失
+    answers = iter(["省略而且", "后面省略而且"])
+    assert align.confirm(beat.sentences[0], raw, "m", lambda s, p, m: (next(answers), [])) == []
+    # 两次都没听到"动作" → 确认缺失
+    beat2 = script.beats({"beats": [{"id": "B", "say": [{"pace": "normal", "text": "用这个动作去证明"}]}]})[0]
+    answers = iter(["用这个递回去证明", "用这个递回去证明"])
+    assert align.confirm(beat2.sentences[0], raw, "m", lambda s, p, m: (next(answers), [])) == ["动作"]
