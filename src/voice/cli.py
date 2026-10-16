@@ -3,7 +3,7 @@
     animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0]
     animind-voice align SPEC --audio 音频目录 [--model 对齐模型]
 
-synth 读 scene-spec 的 say，逐句合成并拼出 <beat>.wav + <beat>.timing.json；
+synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 """
 
@@ -42,6 +42,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "synth":
         from . import synth
+
+        warned = 0
+        for beat in beats:
+            for sentence in beat.sentences:
+                for w in sentence.warnings():
+                    warned += 1
+                    print(f"  ⚠ {beat.id}[{sentence.key}] {w}")
+        if warned:
+            print(f"读法检查：{warned} 条提示（只提示，不拦截合成；改 say 文本后会重新合成这一句）")
 
         synth.load_env(args.env)
         voice_style = doc.get("style", {}).get("voice", {})

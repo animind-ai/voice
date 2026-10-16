@@ -9,6 +9,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
   "numpy>=1.26",
   "scene-spec",
+  "zh-math-reading",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,7 @@ animind-voice = "voice.cli:main"
 
 [tool.uv.sources]
 scene-spec = { path = "../scene-spec", editable = true }
+zh-math-reading = { path = "../zh-math-reading", editable = true }
 
 [dependency-groups]
 dev = ["pytest>=8"]

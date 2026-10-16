@@ -4,7 +4,7 @@ on:
     branches: [main]
   pull_request:
 
-# voice 以可编辑路径依赖同级目录的 scene-spec，所以两个仓库并排检出
+# voice 以可编辑路径依赖同级目录的 scene-spec 和 zh-math-reading，所以几个仓库并排检出
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -19,6 +19,10 @@ jobs:
         with:
           repository: animind-ai/scene-spec
           path: scene-spec
+      - uses: actions/checkout@v4
+        with:
+          repository: animind-ai/zh-math-reading
+          path: zh-math-reading
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - uses: astral-sh/setup-uv@v5
         with:
