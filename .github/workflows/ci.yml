@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# voice 以可编辑路径依赖同级目录的 scene-spec，所以两个仓库并排检出
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: voice
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: voice
+      - uses: actions/checkout@v4
+        with:
+          repository: animind-ai/scene-spec
+          path: scene-spec
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync   # 不装 align 附加依赖：mlx-whisper 只能在 Apple 芯片上跑，测试里用假的 transcriber
+      - run: uvx ruff check .
+      - run: uv run pytest -q
