@@ -1,0 +1,118 @@
+"""书签对齐：对每个 beat，按 timing.json 的句子起止把 beat 音频切开，用 Whisper 听写出逐字时间戳，
+再和稿子逐字配对，得到每个书签的真实时刻；顺带给出每句念得对不对（回听检查）。
+
+结果写回 <beat>.timing.json：
+    "marks": {"s1": {"d0": 3.21, ...}, ...}      # 绝对时刻（相对 beat 音频开头）
+    "check": {"s1": {"ratio": 0.97, "missing": [...], "extra": [...], "heard": "..."}}
+    "aligner": "mlx-community/whisper-large-v3-turbo"
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import textalign
+from .audio import slice_16k
+from .script import Beat, Sentence
+
+DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+PAD = 0.15  # 切片两侧多留一点，免得句首句尾的字被切掉
+
+
+@dataclass
+class SentenceResult:
+    key: str
+    ratio: float
+    marks: dict[str, float] = field(default_factory=dict)
+    how: dict[str, str] = field(default_factory=dict)  # 书签 → matched / interpolated / estimated
+    heard: str = ""
+    missing: list[str] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)
+
+    @property
+    def flagged(self) -> bool:
+        """需要人去听：匹配率低，或者漏了 / 多了两个字以上的片段。"""
+        return self.ratio < 0.85 or any(len(s) >= 2 for s in self.missing + self.extra)
+
+
+def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
+    import mlx_whisper
+
+    result = mlx_whisper.transcribe(
+        samples, path_or_hf_repo=model, language="zh", word_timestamps=True,
+        initial_prompt=prompt, verbose=None, condition_on_previous_text=False,
+    )
+    words = [w for seg in result.get("segments", []) for w in seg.get("words", [])]
+    return result.get("text", "").strip(), words
+
+
+def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, transcriber) -> tuple[str, list[dict]]:
+    """听写一句；逐字时间戳没覆盖到句尾时（Whisper 偶尔在半个多字节字符处断掉），从断点往后补听，最多补两次。"""
+    heard_text, words = transcriber(slice_16k(wav, s0, s1), spoken, model)
+    for _ in range(2):
+        last = max((w["end"] for w in words), default=0.0)
+        if s0 + last >= s1 - 0.6:
+            break
+        covered = sum(1 for w in words for ch in w["word"] if textalign.is_content(ch))
+        rest = spoken[_offset_after(spoken, covered):]
+        if not rest.strip():
+            break
+        cut = max(0.0, last - 0.1)
+        _, more = transcriber(slice_16k(wav, s0 + cut, s1), rest, model)
+        if not more:
+            break
+        words = words + [{**w, "start": w["start"] + cut, "end": w["end"] + cut} for w in more]
+    return heard_text, words
+
+
+def _offset_after(text: str, n: int) -> int:
+    """text 里第 n 个参与对齐的字之后的位置。"""
+    seen = 0
+    for i, ch in enumerate(text):
+        if textalign.is_content(ch):
+            seen += 1
+            if seen == n:
+                return i + 1
+    return len(text)
+
+
+def align_sentence(sentence: Sentence, wav: Path, start: float, end: float, model: str, transcriber=transcribe) -> SentenceResult:
+    s0 = max(0.0, start - PAD)
+    heard_text, words = _transcribe_all(wav, s0, end + PAD, sentence.spoken, model, transcriber)
+    chars = textalign.chars_from_words(words)
+    al = textalign.align(sentence.spoken, chars)
+    res = SentenceResult(sentence.key, round(al.ratio, 3), heard=heard_text)
+    for name, offset in sentence.marks.items():
+        i = textalign.content_index(sentence.spoken, offset)
+        t, how = al.time_at(i, end + PAD - s0)
+        res.marks[name] = round(s0 + t, 3)
+        res.how[name] = how
+    d = textalign.diff(sentence.spoken, heard_text)
+    res.missing, res.extra = d.missing, d.extra
+    return res
+
+
+def align_beat(beat: Beat, audio_dir: Path, model: str = DEFAULT_MODEL, transcriber=transcribe, log=print) -> list[SentenceResult]:
+    timing_path = audio_dir / f"{beat.id}.timing.json"
+    wav = audio_dir / f"{beat.id}.wav"
+    if not beat.sentences:
+        return []
+    if not timing_path.exists() or not wav.exists():
+        raise FileNotFoundError(f"{beat.id}：缺少 {wav.name} 或 {timing_path.name}，先运行 synth")
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    cues = timing["cues"]
+    if len(cues) != len(beat.sentences):
+        raise ValueError(f"{timing_path.name} 有 {len(cues)} 句，scene 里 {beat.id} 有 {len(beat.sentences)} 句；稿子改过就要重新 synth")
+    results = []
+    for sentence, cue in zip(beat.sentences, cues):
+        results.append(align_sentence(sentence, wav, cue["start"], cue["end"], model, transcriber))
+    timing["marks"] = {r.key: r.marks for r in results if r.marks}
+    timing["check"] = {r.key: {"ratio": r.ratio, "missing": r.missing, "extra": r.extra, "heard": r.heard} for r in results}
+    timing["aligner"] = model
+    timing_path.write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
+    flagged = [r.key for r in results if r.flagged]
+    est = sum(1 for r in results for h in r.how.values() if h != "matched")
+    log(f"{beat.id}: {len(results)} 句，书签 {sum(len(r.marks) for r in results)} 个（非精确匹配 {est}），需要回听 {flagged or '无'}")
+    return results

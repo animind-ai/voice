@@ -1,0 +1,44 @@
+[project]
+name = "animind-voice"
+version = "0.1.0"
+description = "scene-spec 的旁白流水线：分句合成、Whisper 书签对齐、回听检查"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Boxi Yu" }]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "numpy>=1.26",
+  "scene-spec",
+]
+
+[project.optional-dependencies]
+align = ["mlx-whisper>=0.4"]
+vertex = ["google-genai>=1.0"]
+
+[project.scripts]
+animind-voice = "voice.cli:main"
+
+[tool.uv.sources]
+scene-spec = { path = "../scene-spec", editable = true }
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voice"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "E741", "B905"]
