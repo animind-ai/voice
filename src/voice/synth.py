@@ -30,6 +30,9 @@ PACE = {
     "slow": "这是重点，语速比平时稍慢一点，关键词加重，但不要拖沓。",
     "ask": "带着设问的语气，像在引导学生一起想，问句尾音上扬。",
 }
+# 每句都加：Gemini TTS 常在逗号后、问句前插进稿子里没有的"诶""嗯""哎"（洞察 #3 #4 #5 #11 #15 #21 都遇到过）。
+# 改这一句会让所有句子的缓存失效（缓存按 instructions 记），已经出片的集不受影响，除非重新合成。
+VERBATIM = "严格照稿子念，一个字不加、一个字不漏，不要加“诶”“嗯”“哎”这类稿子里没有的语气词。"
 GAP = {"normal": 0.35, "brisk": 0.25, "slow": 0.6, "ask": 0.55}
 # 单价（美元）：OpenRouter 上 google/gemini-3.8-flash-tts 输入 $0.5/百万 token、输出 $9/百万 token；
 # Gemini 音频输出按 25 token/秒计，约 $0.0135/分钟。价格变了就改这里。
@@ -123,7 +126,7 @@ def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
     lines_dir.mkdir(parents=True, exist_ok=True)
     wav = lines_dir / f"{name}.wav"
     stamp_path = wav.with_suffix(".json")
-    instructions = f"{PERSONAS.get(persona, PERSONAS['teacher-hs'])}{PACE[pace]}"
+    instructions = f"{PERSONAS.get(persona, PERSONAS['teacher-hs'])}{PACE[pace]}{VERBATIM}"
     stamp = {"text": text, "instructions": instructions, "voice": voice, "model": model}
     if wav.exists() and stamp_path.exists() and json.loads(stamp_path.read_text(encoding="utf-8")) == stamp:
         return wav
