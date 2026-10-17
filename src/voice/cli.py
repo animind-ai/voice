@@ -1,7 +1,7 @@
 """命令行：
 
     animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0]
-    animind-voice align SPEC --audio 音频目录 [--model 对齐模型]
+    animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型]
 
 synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
@@ -33,7 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("align", help="Whisper 对齐书签 + 回听检查")
     a.add_argument("spec", type=Path)
     a.add_argument("--audio", type=Path, required=True)
-    a.add_argument("--model", default=None)
+    a.add_argument("--backend", choices=["mlx", "faster"], help="听写后端；默认 macOS 用 mlx，其他平台用 faster(-whisper)，或取 ANIMIND_ALIGN_BACKEND")
+    a.add_argument("--model", default=None, help="默认按后端取 whisper-large-v3-turbo 的对应版本")
     a.add_argument("--only", nargs="*", default=[])
     args = parser.parse_args(argv)
 
@@ -72,9 +73,12 @@ def main(argv: list[str] | None = None) -> int:
 
     from . import align
 
+    backend = args.backend or align.default_backend()
+    model = args.model or align.DEFAULT_MODELS[backend]
+    print(f"对齐后端 {backend}，模型 {model}")
     flagged = 0
     for beat in beats:
-        results = align.align_beat(beat, args.audio, args.model or align.DEFAULT_MODEL)
+        results = align.align_beat(beat, args.audio, model, align.TRANSCRIBERS[backend])
         for r in results:
             if r.flagged:
                 flagged += 1

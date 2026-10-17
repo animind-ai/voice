@@ -5,7 +5,7 @@
 ## 两个命令
 
 ```bash
-uv sync --extra align
+uv sync --extra align        # macOS（Apple 芯片）；Linux + NVIDIA 用 uv sync --extra align-cuda
 # 1. 合成：每句一段音频（按文本 + 语气 + 人设 + 模型缓存），拼成 <beat>.wav + <beat>.timing.json
 uv run animind-voice synth ../scene-spec/examples/s67-p01.scene.yaml --out build/audio --env /path/to/.env
 # 2. 对齐 + 回听：把书签的真实时刻写回 timing.json，列出需要人去听的句子
@@ -16,7 +16,7 @@ uv run animind-voice align ../scene-spec/examples/s67-p01.scene.yaml --audio bui
 
 合成之前，每句旁白先交给 [zh-math-reading](https://github.com/animind-ai/zh-math-reading)：`say` 里的 `$...$` 公式展开成读法（`$a_{n+1}^2$` → “a n 加一的平方”），书签位置按展开后的文字计算；同时打印读法风险提示（冒号后紧跟字母、长句、多音字），只提示、不拦截。不含公式的句子读法逐字节不变，已有的音频缓存继续有效。zh-math-reading 是同级目录的可编辑路径依赖，和 scene-spec 一样要并排检出。
 
-`align` 在本机用 [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)（Apple 芯片）跑 `whisper-large-v3-turbo`，不需要联网 API。做法：
+`align` 在本机跑 `whisper-large-v3-turbo`，不需要联网 API。后端按平台自动选：macOS 用 [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)（Apple 芯片，`--extra align`），其他平台用 [faster-whisper](https://github.com/SYSTRAN/faster-whisper)（CTranslate2，有 CUDA 就用 GPU、float16，`--extra align-cuda`）；`--backend mlx|faster` 或环境变量 `ANIMIND_ALIGN_BACKEND` 可以强制指定，`ANIMIND_ALIGN_DEVICE=cpu|cuda` 指定设备，多卡时用 `CUDA_VISIBLE_DEVICES` 选卡。两个后端用的是同一个模型的不同格式（`mlx-community/whisper-large-v3-turbo` / `mobiuslabsgmbh/faster-whisper-large-v3-turbo`），书签时刻相差在 0.1 秒左右。做法：
 
 1. 按 timing.json 的句子起止把 beat 音频切开，每句单独听写，稿子作为提示词；
 2. Whisper 给出逐字时间戳，和稿子逐字配对（数字按汉字比较，标点不算）；

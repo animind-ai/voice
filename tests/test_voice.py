@@ -129,3 +129,39 @@ def test_confirm_drops_whisper_only_misses(tmp_path):
     beat2 = script.beats({"beats": [{"id": "B", "say": [{"pace": "normal", "text": "用这个动作去证明"}]}]})[0]
     answers = iter(["用这个递回去证明", "用这个递回去证明"])
     assert align.confirm(beat2.sentences[0], raw, "m", lambda s, p, m: (next(answers), [])) == ["动作"]
+
+
+def test_backend_choice(monkeypatch):
+    monkeypatch.delenv("ANIMIND_ALIGN_BACKEND", raising=False)
+    monkeypatch.setattr(align.sys, "platform", "linux")
+    assert align.default_backend() == "faster"
+    monkeypatch.setattr(align.sys, "platform", "darwin")
+    assert align.default_backend() == "mlx"
+    monkeypatch.setenv("ANIMIND_ALIGN_BACKEND", "faster")
+    assert align.default_backend() == "faster"
+    monkeypatch.setenv("ANIMIND_ALIGN_BACKEND", "cuda")
+    try:
+        align.default_backend()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未知后端应报错")
+
+
+def test_faster_output_matches_mlx_shape(monkeypatch):
+    """faster-whisper 的 Segment / Word 对象转成和 mlx 一样的 dict，textalign 能直接用。"""
+    from types import SimpleNamespace as NS
+
+    seen = {}
+
+    class FakeModel:
+        def transcribe(self, samples, **kw):
+            seen.update(kw)
+            words = [NS(word=ch, start=i * 0.2, end=i * 0.2 + 0.2, probability=0.9) for i, ch in enumerate("一二三")]
+            return iter([NS(text="一二", words=words[:2]), NS(text="三", words=words[2:])]), None
+
+    monkeypatch.setitem(align._faster_models, "m", FakeModel())
+    text, words = align.transcribe_faster(None, "", "m")
+    assert text == "一二三" and seen["initial_prompt"] is None and seen["word_timestamps"]
+    assert [w["word"] for w in words] == ["一", "二", "三"] and words[2]["start"] == 0.4
+    assert textalign.align("一二三", textalign.chars_from_words(words)).ratio == 1.0

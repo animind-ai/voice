@@ -5,11 +5,16 @@
     "marks": {"s1": {"d0": 3.21, ...}, ...}      # 绝对时刻（相对 beat 音频开头）
     "check": {"s1": {"ratio": 0.97, "missing": [...], "extra": [...], "heard": "..."}}
     "aligner": "mlx-community/whisper-large-v3-turbo"
+
+听写后端按平台自动选：macOS 用 mlx-whisper（Apple 芯片），其他平台用 faster-whisper（CTranslate2，有 CUDA 就用 GPU）。
+环境变量 ANIMIND_ALIGN_BACKEND=mlx|faster 或 CLI 的 --backend 可以强制指定。
 """
 
 from __future__ import annotations
 
 import json
+import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,7 +22,11 @@ from . import textalign
 from .audio import slice_16k
 from .script import Beat, Sentence
 
-DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+BACKENDS = ("mlx", "faster")
+DEFAULT_MODELS = {
+    "mlx": "mlx-community/whisper-large-v3-turbo",
+    "faster": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",  # 同一个 large-v3-turbo 的 CTranslate2 版本
+}
 PAD = 0.15  # 切片两侧多留一点，免得句首句尾的字被切掉
 
 
@@ -45,7 +54,16 @@ class SentenceResult:
         return bool(self.confirmed) if self.confirmed is not None else True
 
 
-def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
+def default_backend() -> str:
+    forced = os.environ.get("ANIMIND_ALIGN_BACKEND", "").strip().lower()
+    if forced:
+        if forced not in BACKENDS:
+            raise ValueError(f"ANIMIND_ALIGN_BACKEND={forced!r}：只能是 {' / '.join(BACKENDS)}")
+        return forced
+    return "mlx" if sys.platform == "darwin" else "faster"
+
+
+def transcribe_mlx(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
     import mlx_whisper
 
     result = mlx_whisper.transcribe(
@@ -55,6 +73,45 @@ def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
     )
     words = [w for seg in result.get("segments", []) for w in seg.get("words", [])]
     return result.get("text", "").strip(), words
+
+
+_faster_models: dict = {}
+
+
+def _faster_model(model: str):
+    if model not in _faster_models:
+        from faster_whisper import WhisperModel
+
+        device = os.environ.get("ANIMIND_ALIGN_DEVICE")
+        if not device:
+            import ctranslate2
+
+            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
+        _faster_models[model] = WhisperModel(model, device=device, compute_type=compute)
+    return _faster_models[model]
+
+
+def transcribe_faster(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
+    """和 transcribe_mlx 同样的参数、同样的输出：全文 + [{"word", "start", "end"}, ...]。"""
+    segments, _ = _faster_model(model).transcribe(
+        samples, language="zh", word_timestamps=True, initial_prompt=prompt or None,
+        condition_on_previous_text=False, compression_ratio_threshold=1.8,
+        beam_size=1,  # 贪心解码，和 mlx-whisper 一致
+        vad_filter=False,  # 切片本来就是一句话；VAD 会把句首句尾的轻声字切掉
+    )
+    text, words = [], []
+    for seg in segments:
+        text.append(seg.text)
+        words += [{"word": w.word, "start": w.start, "end": w.end, "probability": w.probability} for w in seg.words or []]
+    return "".join(text).strip(), words
+
+
+TRANSCRIBERS = {"mlx": transcribe_mlx, "faster": transcribe_faster}
+
+
+def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
+    return TRANSCRIBERS[default_backend()](samples, prompt, model)
 
 
 def _looks_hallucinated(spoken: str, heard: str) -> bool:
@@ -138,7 +195,8 @@ def confirm(sentence: Sentence, raw_wav: Path, model: str, transcriber=transcrib
     return [m for m in textalign.diff(sentence.spoken, heard_prompted).missing if set(m) & both]
 
 
-def align_beat(beat: Beat, audio_dir: Path, model: str = DEFAULT_MODEL, transcriber=transcribe, log=print) -> list[SentenceResult]:
+def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcriber=transcribe, log=print) -> list[SentenceResult]:
+    model = model or DEFAULT_MODELS[default_backend()]
     timing_path = audio_dir / f"{beat.id}.timing.json"
     wav = audio_dir / f"{beat.id}.wav"
     if not beat.sentences:

@@ -13,7 +13,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-align = ["mlx-whisper>=0.4"]
+align = ["mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+align-cuda = ["faster-whisper>=1.1"]  # Linux / CUDA；1.1 起有 large-v3-turbo
 vertex = ["google-genai>=1.0"]
 
 [project.scripts]
