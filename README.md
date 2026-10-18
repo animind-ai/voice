@@ -16,6 +16,8 @@ uv run animind-voice pitch ../scene-spec/examples/s67-p01.scene.yaml --audio bui
 
 Gemini TTS 偶尔会在单句里换成另一个性别的声音（同一个 `voice`、同一个模型）。所以人设文案不写性别，每句都要求“全程保持同一个声音”；合成完还会测这句的基频中位数，和这个声音应有的音区比（目前认得 Kore、Aoede、Leda、Zephyr 是女声，低于 150 Hz 算换声；Puck、Charon、Fenrir、Orus 是男声，高于 190 Hz 算换声），换了声就重合成，最多 3 次，每次都记账；3 次都不过关时留最接近的一版并提示回听。其他声音不做判断。`pitch` 对已经合成好的目录做同样的检查。
 
+英文版：三个命令都加 `--lang en`，念每句的 `en`（书签写在 `en` 里，见 scene-spec 设计稿 §7.7），用单独的音频目录。合成指令换成英文、Vertex 用 en-US，不过中文读法规则；对齐时 Whisper 按英文听写，听到的阿拉伯数字先拼成单词（2 → two）再和稿子配对。
+
 `synth` 的模型和声音从 `--env` 文件或环境变量读：`GEMINI_TTS_MODEL`（名字带 `/` 走 OpenRouter，需要 `OPENROUTER_API_KEY`；否则走 Vertex，需要 `uv sync --extra vertex` 和 `GOOGLE_*`）、`GEMINI_TTS_VOICE`。密钥从不打印，也不要放进仓库。人设取场景文件的 `style.voice.persona`，语速取 `style.voice.speed`（atempo 变速，不变调）。
 
 合成之前，每句旁白先交给 [zh-math-reading](https://github.com/animind-ai/zh-math-reading)：`say` 里的 `$...$` 公式展开成读法（`$a_{n+1}^2$` → “a n 加一的平方”），书签位置按展开后的文字计算；同时打印读法风险提示（冒号后紧跟字母、长句、多音字），只提示、不拦截。不含公式的句子读法逐字节不变，已有的音频缓存继续有效。zh-math-reading 是同级目录的可编辑路径依赖，和 scene-spec 一样要并排检出。

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import difflib
+import re
 import unicodedata
 from dataclasses import dataclass
 
@@ -22,6 +23,33 @@ def is_content(ch: str) -> bool:
 
 def normalize(ch: str) -> str:
     return ch.lower().translate(DIGITS)
+
+
+_ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen " \
+        "seventeen eighteen nineteen".split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+_NUMBER = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+
+
+def _words(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("" if n % 10 == 0 else " " + _ONES[n % 10])
+    if n < 1000:
+        return _ONES[n // 100] + " hundred" + ("" if n % 100 == 0 else " " + _words(n % 100))
+    if n < 1_000_000:
+        return _words(n // 1000) + " thousand" + ("" if n % 1000 == 0 else " " + _words(n % 1000))
+    return " ".join(_ONES[int(d)] for d in str(n))
+
+
+def spell_numbers(text: str) -> str:
+    """英文听写里的阿拉伯数字拼成单词（2 → two，3.5 → three point five），好和英文稿逐字配对。"""
+    def say(m: re.Match) -> str:
+        whole, _, frac = m.group(0).replace(",", "").partition(".")
+        out = _words(int(whole))
+        return out + (" point " + " ".join(_ONES[int(d)] for d in frac) if frac else "")
+    return _NUMBER.sub(say, text)
 
 
 @dataclass

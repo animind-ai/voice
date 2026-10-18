@@ -4,6 +4,7 @@
 结果写回 <beat>.timing.json：
     "marks": {"s1": {"d0": 3.21, ...}, ...}      # 绝对时刻（相对 beat 音频开头）
     "check": {"s1": {"ratio": 0.97, "missing": [...], "extra": [...], "heard": "..."}}
+    "words": {"s1": {"n": 42, "at": [[0, 0.31], [5, 0.62], ...]}}  # 稿子第 i 个参与对齐的字（词首）的时刻，n 是总字数；kit 用来给字幕切条定时
     "aligner": "mlx-community/whisper-large-v3-turbo"
 
 听写后端按平台自动选：macOS 用 mlx-whisper（Apple 芯片），其他平台用 faster-whisper（CTranslate2，有 CUDA 就用 GPU）。
@@ -40,6 +41,8 @@ class SentenceResult:
     missing: list[str] = field(default_factory=list)
     extra: list[str] = field(default_factory=list)
     confirmed: list[str] | None = None  # 复核后仍然缺的字；None 表示没复核
+    words: list[list[float]] = field(default_factory=list)  # [[稿子里第几个字（词首）, 时刻], ...]，只记精确匹配上的
+    content: int = 0  # 稿子里参与对齐的字数
 
     @property
     def suspicious(self) -> bool:
@@ -63,11 +66,11 @@ def default_backend() -> str:
     return "mlx" if sys.platform == "darwin" else "faster"
 
 
-def transcribe_mlx(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
+def transcribe_mlx(samples, prompt: str, model: str, language: str = "zh") -> tuple[str, list[dict]]:
     import mlx_whisper
 
     result = mlx_whisper.transcribe(
-        samples, path_or_hf_repo=model, language="zh", word_timestamps=True,
+        samples, path_or_hf_repo=model, language=language, word_timestamps=True,
         initial_prompt=prompt or None, verbose=None, condition_on_previous_text=False,
         compression_ratio_threshold=1.8,  # 比默认 2.4 严，更早触发温度回退，压住重复死循环
     )
@@ -92,10 +95,10 @@ def _faster_model(model: str):
     return _faster_models[model]
 
 
-def transcribe_faster(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
+def transcribe_faster(samples, prompt: str, model: str, language: str = "zh") -> tuple[str, list[dict]]:
     """和 transcribe_mlx 同样的参数、同样的输出：全文 + [{"word", "start", "end"}, ...]。"""
     segments, _ = _faster_model(model).transcribe(
-        samples, language="zh", word_timestamps=True, initial_prompt=prompt or None,
+        samples, language=language, word_timestamps=True, initial_prompt=prompt or None,
         condition_on_previous_text=False, compression_ratio_threshold=1.8,
         beam_size=1,  # 贪心解码，和 mlx-whisper 一致
         vad_filter=False,  # 切片本来就是一句话；VAD 会把句首句尾的轻声字切掉
@@ -110,8 +113,8 @@ def transcribe_faster(samples, prompt: str, model: str) -> tuple[str, list[dict]
 TRANSCRIBERS = {"mlx": transcribe_mlx, "faster": transcribe_faster}
 
 
-def transcribe(samples, prompt: str, model: str) -> tuple[str, list[dict]]:
-    return TRANSCRIBERS[default_backend()](samples, prompt, model)
+def transcribe(samples, prompt: str, model: str, language: str = "zh") -> tuple[str, list[dict]]:
+    return TRANSCRIBERS[default_backend()](samples, prompt, model, language)
 
 
 def _looks_hallucinated(spoken: str, heard: str) -> bool:
@@ -125,15 +128,16 @@ def _looks_hallucinated(spoken: str, heard: str) -> bool:
     return missing > 0.4 * a
 
 
-def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, transcriber) -> tuple[str, list[dict]]:
+def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, transcriber,
+                    language: str = "zh") -> tuple[str, list[dict]]:
     """听写一句；逐字时间戳没覆盖到句尾时（Whisper 偶尔在半个多字节字符处断掉），从断点往后补听，最多补两次。
 
     听写像是幻觉（重复死循环、乱码）时，去掉提示词再听一遍，取和稿子更接近的那次。
     """
     samples = slice_16k(wav, s0, s1)
-    heard_text, words = transcriber(samples, spoken, model)
+    heard_text, words = transcriber(samples, spoken, model, language)
     if _looks_hallucinated(spoken, heard_text):
-        retry_text, retry_words = transcriber(samples, "", model)
+        retry_text, retry_words = transcriber(samples, "", model, language)
         if textalign.align(spoken, textalign.chars_from_words(retry_words)).ratio > \
                 textalign.align(spoken, textalign.chars_from_words(words)).ratio:
             heard_text, words = retry_text, retry_words
@@ -146,7 +150,7 @@ def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, tr
         if not rest.strip():
             break
         cut = max(0.0, last - 0.1)
-        _, more = transcriber(slice_16k(wav, s0 + cut, s1), rest, model)
+        _, more = transcriber(slice_16k(wav, s0 + cut, s1), rest, model, language)
         if not more:
             break
         words = words + [{**w, "start": w["start"] + cut, "end": w["end"] + cut} for w in more]
@@ -166,7 +170,10 @@ def _offset_after(text: str, n: int) -> int:
 
 def align_sentence(sentence: Sentence, wav: Path, start: float, end: float, model: str, transcriber=transcribe) -> SentenceResult:
     s0 = max(0.0, start - PAD)
-    heard_text, words = _transcribe_all(wav, s0, end + PAD, sentence.spoken, model, transcriber)
+    heard_text, words = _transcribe_all(wav, s0, end + PAD, sentence.spoken, model, transcriber, sentence.lang)
+    if sentence.lang == "en":  # Whisper 常把念出来的 two 写成 2：先拼回单词再和稿子配对
+        heard_text = textalign.spell_numbers(heard_text)
+        words = [{**w, "word": textalign.spell_numbers(w["word"])} for w in words]
     chars = textalign.chars_from_words(words)
     al = textalign.align(sentence.spoken, chars)
     res = SentenceResult(sentence.key, round(al.ratio, 3), heard=heard_text)
@@ -175,6 +182,15 @@ def align_sentence(sentence: Sentence, wav: Path, start: float, end: float, mode
         t, how = al.time_at(i, end + PAD - s0)
         res.marks[name] = round(s0 + t, 3)
         res.how[name] = how
+    starts, k, prev = [], 0, False
+    for ch in sentence.spoken:  # 词首：前一个字符不参与对齐（空格、标点）的字
+        if textalign.is_content(ch):
+            if not prev:
+                starts.append(k)
+            k += 1
+        prev = textalign.is_content(ch)
+    res.words = [[i, round(s0 + al.heard[al.mapping[i]].start, 3)] for i in starts if i in al.mapping]
+    res.content = len(al.script)
     d = textalign.diff(sentence.spoken, heard_text)
     res.missing, res.extra = d.missing, d.extra
     return res
@@ -187,8 +203,10 @@ def confirm(sentence: Sentence, raw_wav: Path, model: str, transcriber=transcrib
     变速让字更难辨认，提示词会把它往稿子上带，也可能带偏。
     """
     samples = slice_16k(raw_wav, 0.0, 600.0)
-    heard_plain, _ = transcriber(samples, "", model)
-    heard_prompted, _ = transcriber(samples, sentence.spoken, model)
+    heard_plain, _ = transcriber(samples, "", model, sentence.lang)
+    heard_prompted, _ = transcriber(samples, sentence.spoken, model, sentence.lang)
+    if sentence.lang == "en":
+        heard_plain, heard_prompted = textalign.spell_numbers(heard_plain), textalign.spell_numbers(heard_prompted)
     gone_a = set("".join(textalign.diff(sentence.spoken, heard_plain).missing))
     gone_b = set("".join(textalign.diff(sentence.spoken, heard_prompted).missing))
     both = gone_a & gone_b
@@ -217,6 +235,7 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
     timing["marks"] = {r.key: r.marks for r in results if r.marks}
     timing["check"] = {r.key: {"ratio": r.ratio, "missing": r.missing, "extra": r.extra, "heard": r.heard,
                                "confirmed": r.confirmed} for r in results}
+    timing["words"] = {r.key: {"n": r.content, "at": r.words} for r in results if r.words}
     timing["aligner"] = model
     timing_path.write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
     flagged = [r.key for r in results if r.flagged]

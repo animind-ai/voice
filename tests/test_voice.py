@@ -71,7 +71,7 @@ def test_align_beat_with_fake_transcriber(tmp_path):
     beat = script.beats({"beats": [{"id": "B", "say": [{"id": "s1", "pace": "normal", "text": "一二{@a}三四"}]}]})[0]
     synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=lambda *a: tone(1.0), log=lambda *_: None)
 
-    def transcriber(samples, prompt, model):
+    def transcriber(samples, prompt, model, language="zh"):
         words = [{"word": ch, "start": 0.15 + i * 0.25, "end": 0.4 + i * 0.25} for i, ch in enumerate("一二三四")]
         return "一二三四", words
 
@@ -88,7 +88,7 @@ def test_tail_relisten_when_word_stamps_stop_early(tmp_path):
     synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=lambda *a: tone(3.0), log=lambda *_: None)
     calls = []
 
-    def transcriber(samples, prompt, model):
+    def transcriber(samples, prompt, model, language="zh"):
         calls.append(prompt)
         if len(calls) == 1:  # 第一遍只给出前三个字的时间戳
             return "一二三四五六七八", [{"word": ch, "start": i * 0.3, "end": i * 0.3 + 0.3} for i, ch in enumerate("一二三")]
@@ -124,11 +124,11 @@ def test_confirm_drops_whisper_only_misses(tmp_path):
     raw = tmp_path / "lines" / "B-0.wav"
     # 不带提示词时漏了"后面"，带提示词时听全了 → 不算确认缺失
     answers = iter(["省略而且", "后面省略而且"])
-    assert align.confirm(beat.sentences[0], raw, "m", lambda s, p, m: (next(answers), [])) == []
+    assert align.confirm(beat.sentences[0], raw, "m", lambda s, p, m, lang="zh": (next(answers), [])) == []
     # 两次都没听到"动作" → 确认缺失
     beat2 = script.beats({"beats": [{"id": "B", "say": [{"pace": "normal", "text": "用这个动作去证明"}]}]})[0]
     answers = iter(["用这个递回去证明", "用这个递回去证明"])
-    assert align.confirm(beat2.sentences[0], raw, "m", lambda s, p, m: (next(answers), [])) == ["动作"]
+    assert align.confirm(beat2.sentences[0], raw, "m", lambda s, p, m, lang="zh": (next(answers), [])) == ["动作"]
 
 
 def test_backend_choice(monkeypatch):
@@ -227,3 +227,38 @@ def test_loose_cache_ignores_changed_instructions(tmp_path):
     synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=speak, log=lambda *_: None,
                      force={"B-1"}, loose=True)
     assert calls == ["第一句。", "第二句。", "第二句。"]  # 只重念强制的那句，旧人设的第一句沿用缓存
+
+
+# ---------- 英文版（style.lang: en） ----------
+
+def test_english_sentences_skip_zh_normalize_and_keep_marks():
+    doc = {"style": {"lang": "en"}, "beats": [{"id": "B", "say": [
+        {"pace": "normal", "text": "{@a} side a is two and {@b}side b is three."}]}]}
+    s = script.beats(doc)[0].sentences[0]
+    assert s.spoken == "side a is two and side b is three." and s.lang == "en"
+    assert s.spoken[s.marks["a"]:].startswith("side a") and s.spoken[s.marks["b"]:].startswith("side b")
+    assert s.warnings() == []
+
+
+def test_english_instructions():
+    text = synth.instructions_for("teacher-hs", "ask", "en")
+    assert text.isascii() and "exactly as written" in text and "questioning" in text
+    assert synth.instructions_for("teacher-hs", "ask") != text
+
+
+def test_spell_numbers_for_english_alignment():
+    assert textalign.spell_numbers("side a is 2, 3.5 and 1,024") == \
+        "side a is two, three point five and one thousand twenty four"
+    heard = textalign.chars_from_words([{"word": " two", "start": 1.0, "end": 1.3}])
+    al = textalign.align("is two", heard)
+    assert al.time_at(textalign.content_index("is two", 3), 2.0) == (1.0, "matched")
+
+
+def test_align_records_word_start_times(monkeypatch):
+    monkeypatch.setattr(align, "slice_16k", lambda *a: None)
+    doc = {"style": {"lang": "en"}, "beats": [{"id": "B", "say": [{"pace": "normal", "text": "one two"}]}]}
+    sentence = script.beats(doc)[0].sentences[0]
+    words = [{"word": " one", "start": 0.1, "end": 0.4}, {"word": " two", "start": 0.9, "end": 1.2}]
+    res = align.align_sentence(sentence, Path("unused.wav"), 0.5, 2.0, "m",
+                               transcriber=lambda *a, **k: ("one two", words))
+    assert res.content == 6 and res.words == [[0, 0.45], [3, 1.25]]

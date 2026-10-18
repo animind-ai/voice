@@ -1,12 +1,13 @@
 """命令行：
 
-    animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0]
-    animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型]
-    animind-voice pitch SPEC --audio 音频目录 [--fix --env 密钥文件]
+    animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0] [--lang en]
+    animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型] [--lang en]
+    animind-voice pitch SPEC --audio 音频目录 [--fix --env 密钥文件] [--lang en]
 
 synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
+--lang en 念英文版（每句的 en，书签写在 en 里；见 scene_spec.localize），三个命令要用同一个 --lang 和音频目录。
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import os
 import sys
 from pathlib import Path
 
+from scene_spec import localize
 from scene_spec.loader import load_file
 
 from . import script
@@ -44,9 +46,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fix", action="store_true", help="重合成异常句（要 --env），之后要重新 align")
     p.add_argument("--env", type=Path)
     p.add_argument("--only", nargs="*", default=[])
+    for cmd in (s, a, p):
+        cmd.add_argument("--lang", choices=["zh", "en"], default="zh", help="念哪种语言的版本，默认中文")
     args = parser.parse_args(argv)
 
-    doc = load_file(args.spec)
+    doc = localize(load_file(args.spec), args.lang)
     beats = [b for b in script.beats(doc) if not args.only or b.id in args.only]
 
     if args.command == "pitch":

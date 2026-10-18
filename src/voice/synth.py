@@ -38,6 +38,24 @@ VERBATIM = "严格照稿子念，一个字不加、一个字不漏，不要加�
 # 合成后还会测音高（pitch.py），换了声就重合成。
 STEADY = "全程保持同一个声音，音色、音高前后一致，不要换声音。"
 PITCH_RETRIES = 3
+# 英文版（style.lang: en）：同样的人设和要求，用英文写给 TTS。
+PERSONAS_EN = {
+    "teacher-hs": "You are a warm, experienced high-school maths teacher explaining the problem on screen to a student. "
+                  "Speak naturally, as if face to face. Not a newsreader voice, and never sound like you are reading a script.",
+    "peer-ms": "You are a curious, patient older student looking at a maths problem together with a younger student. "
+               "Relaxed and natural, not a newsreader voice.",
+    "friend-ps": "You are a big friend to a primary-school child, looking at a small maths puzzle together. "
+                 "Short sentences, slow and warm.",
+}
+PACE_EN = {
+    "normal": "Normal pace, with natural intonation.",
+    "brisk": "This is simple arithmetic: a little brisker, move through it lightly.",
+    "slow": "This is the key point: slightly slower than usual, stress the key words, but don't drag.",
+    "ask": "A guiding, questioning tone, as if inviting the student to think along; let questions rise at the end.",
+}
+VERBATIM_EN = "Read the script exactly as written: add nothing, drop nothing, no filler words like \"um\", \"uh\" or \"so\" that aren't in it."
+STEADY_EN = "Keep the same voice throughout: same timbre and pitch from start to finish."
+LANGUAGE_CODE = {"zh": "zh-CN", "en": "en-US"}
 GAP = {"normal": 0.35, "brisk": 0.25, "slow": 0.6, "ask": 0.55}
 # 单价（美元）：OpenRouter 上 google/gemini-3.8-flash-tts 输入 $0.5/百万 token、输出 $9/百万 token；
 # Gemini 音频输出按 25 token/秒计，约 $0.0135/分钟。价格变了就改这里。
@@ -79,15 +97,17 @@ def vertex_speak(instructions: str, text: str, model: str) -> bytes:
     from google import genai
     from google.genai import types
 
+    lang = "en" if text.isascii() else "zh"  # 英文版的稿子全是西文字符
     client = genai.Client(vertexai=True, project=os.environ["GOOGLE_CLOUD_PROJECT"],
                           location=os.environ.get("GOOGLE_CLOUD_REGION", "us-central1"), api_key=os.environ["GOOGLE_API_KEY"])
     response = client.models.generate_content(
         model=model,
-        contents=f"{instructions}请用这种方式朗读下面这段话：\n{text}",
+        contents=(f"{instructions}请用这种方式朗读下面这段话：\n{text}" if lang == "zh"
+                  else f"{instructions} Read the following in that way:\n{text}"),
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
-                language_code="zh-CN",
+                language_code=LANGUAGE_CODE[lang],
                 voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=os.environ["GEMINI_TTS_VOICE"])),
             ),
         ),
@@ -126,12 +146,14 @@ def _speed(part: Path, speed: float) -> Path:
     return fast
 
 
-def instructions_for(persona: str, pace: str) -> str:
+def instructions_for(persona: str, pace: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return " ".join([PERSONAS_EN.get(persona, PERSONAS_EN["teacher-hs"]), PACE_EN[pace], VERBATIM_EN, STEADY_EN])
     return f"{PERSONAS.get(persona, PERSONAS['teacher-hs'])}{PACE[pace]}{VERBATIM}{STEADY}"
 
 
 def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, model: str, voice: str,
-               speak: Speak = default_speak, log=print, force: bool = False, loose: bool = False) -> Path:
+               speak: Speak = default_speak, log=print, force: bool = False, loose: bool = False, lang: str = "zh") -> Path:
     """合成一句（有缓存就直接用）。
 
     force：不管缓存，重合成。loose：缓存只核对文本、声音和模型，不核对 instructions——
@@ -140,7 +162,7 @@ def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
     lines_dir.mkdir(parents=True, exist_ok=True)
     wav = lines_dir / f"{name}.wav"
     stamp_path = wav.with_suffix(".json")
-    instructions = instructions_for(persona, pace)
+    instructions = instructions_for(persona, pace, lang)
     stamp = {"text": text, "instructions": instructions, "voice": voice, "model": model}
     if not force and wav.exists() and stamp_path.exists():
         cached = json.loads(stamp_path.read_text(encoding="utf-8"))
@@ -169,7 +191,7 @@ def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
 
 
 def estimate_cost(text: str, instructions: str, seconds: float) -> float:
-    input_tokens = (len(text) + len(instructions)) * 1.5  # 粗估：中文约 1–2 token/字
+    input_tokens = (len(text) + len(instructions)) * 1.5  # 粗估：中文约 1–2 token/字（英文按字母算偏高，宁多不少）
     return input_tokens * PRICE_INPUT_PER_TOKEN + seconds * AUDIO_TOKENS_PER_SECOND * PRICE_OUTPUT_PER_TOKEN
 
 
@@ -200,7 +222,7 @@ def synth_beat(beat: Beat, out_dir: Path, persona: str, model: str, voice: str, 
         return {}
     parts = [
         _speed(synth_line(out_dir / "lines", f"{beat.id}-{s.index}", s.pace, s.spoken, persona, model, voice, speak, log,
-                          force=f"{beat.id}-{s.index}" in (force or set()), loose=loose), speed)
+                          force=f"{beat.id}-{s.index}" in (force or set()), loose=loose, lang=s.lang), speed)
         for s in beat.sentences
     ]
     cues, cursor, inputs, filters = [], LEAD, [], []
