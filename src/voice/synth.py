@@ -16,12 +16,13 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from . import pitch
 from .audio import wav_seconds
 from .script import Beat
 
 PERSONAS = {
     "teacher-hs": "你是一位亲切、有经验的高中数学老师，正对着屏幕上的题目给学生讲解。说话自然，像面对面讲题，不要播音腔，也不要念稿子的感觉。",
-    "peer-ms": "你是一位好奇、耐心的学长，正和初中同学一起看一道数学题。语气轻松自然，适度设问，不要播音腔。",
+    "peer-ms": "你是一位好奇、耐心的高年级同学，正和初中同学一起看一道数学题。语气轻松自然，适度设问，不要播音腔。",
     "friend-ps": "你是小学生的大朋友，正一起看一个数学小问题。句子短、语速慢、语气亲切，多用“我们一起看”。",
 }
 PACE = {
@@ -33,6 +34,10 @@ PACE = {
 # 每句都加：Gemini TTS 常在逗号后、问句前插进稿子里没有的"诶""嗯""哎"（洞察 #3 #4 #5 #11 #15 #21 都遇到过）。
 # 改这一句会让所有句子的缓存失效（缓存按 instructions 记），已经出片的集不受影响，除非重新合成。
 VERBATIM = "严格照稿子念，一个字不加、一个字不漏，不要加“诶”“嗯”“哎”这类稿子里没有的语气词。"
+# Gemini TTS 偶尔会在单句里换成另一个性别的声音（同一个 voice）；人设里不写性别，再明确要求声音前后一致。
+# 合成后还会测音高（pitch.py），换了声就重合成。
+STEADY = "全程保持同一个声音，音色、音高前后一致，不要换声音。"
+PITCH_RETRIES = 3
 GAP = {"normal": 0.35, "brisk": 0.25, "slow": 0.6, "ask": 0.55}
 # 单价（美元）：OpenRouter 上 google/gemini-3.8-flash-tts 输入 $0.5/百万 token、输出 $9/百万 token；
 # Gemini 音频输出按 25 token/秒计，约 $0.0135/分钟。价格变了就改这里。
@@ -121,20 +126,45 @@ def _speed(part: Path, speed: float) -> Path:
     return fast
 
 
+def instructions_for(persona: str, pace: str) -> str:
+    return f"{PERSONAS.get(persona, PERSONAS['teacher-hs'])}{PACE[pace]}{VERBATIM}{STEADY}"
+
+
 def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, model: str, voice: str,
-               speak: Speak = default_speak, log=print) -> Path:
+               speak: Speak = default_speak, log=print, force: bool = False, loose: bool = False) -> Path:
+    """合成一句（有缓存就直接用）。
+
+    force：不管缓存，重合成。loose：缓存只核对文本、声音和模型，不核对 instructions——
+    只修个别句子时用，免得人设文案改过就把同一段的其他句子全部重念。
+    """
     lines_dir.mkdir(parents=True, exist_ok=True)
     wav = lines_dir / f"{name}.wav"
     stamp_path = wav.with_suffix(".json")
-    instructions = f"{PERSONAS.get(persona, PERSONAS['teacher-hs'])}{PACE[pace]}{VERBATIM}"
+    instructions = instructions_for(persona, pace)
     stamp = {"text": text, "instructions": instructions, "voice": voice, "model": model}
-    if wav.exists() and stamp_path.exists() and json.loads(stamp_path.read_text(encoding="utf-8")) == stamp:
-        return wav
-    _to_wav(speak(instructions, text, model), wav)
+    if not force and wav.exists() and stamp_path.exists():
+        cached = json.loads(stamp_path.read_text(encoding="utf-8"))
+        keys = ("text", "voice", "model") if loose else tuple(stamp)
+        if all(cached.get(k) == stamp[k] for k in keys):
+            return wav
+    best: tuple[float, bytes, float] | None = None
+    for attempt in range(1, PITCH_RETRIES + 1):
+        audio = speak(instructions, text, model)
+        _to_wav(audio, wav)
+        seconds = wav_seconds(wav)
+        cost = log_usage(lines_dir.parent / "tts_usage.jsonl", name, model, text, instructions, seconds)
+        f0 = pitch.median_f0(wav)
+        log(f"  合成 {name} {seconds:.1f}s，音高 {f0:.0f} Hz，约 ${cost:.4f}")
+        if not pitch.off_voice(f0, voice):
+            best = None
+            break
+        if best is None or pitch.closeness(f0, voice) > best[0]:
+            best = (pitch.closeness(f0, voice), audio, f0)
+        log(f"  ⚠ {name} 音高 {f0:.0f} Hz，不像 {voice}（像换了声音），重合成（第 {attempt}/{PITCH_RETRIES} 次）")
+    if best is not None:
+        _to_wav(best[1], wav)
+        log(f"  ⚠ {name} 重试 {PITCH_RETRIES} 次仍像换了声音，留下最接近的一版（{best[2]:.0f} Hz），请回听")
     stamp_path.write_text(json.dumps(stamp, ensure_ascii=False), encoding="utf-8")
-    seconds = wav_seconds(wav)
-    cost = log_usage(lines_dir.parent / "tts_usage.jsonl", name, model, text, instructions, seconds)
-    log(f"  合成 {name} {seconds:.1f}s，约 ${cost:.4f}")
     return wav
 
 
@@ -164,11 +194,13 @@ def total_cost(path: Path) -> tuple[int, float]:
 
 
 def synth_beat(beat: Beat, out_dir: Path, persona: str, model: str, voice: str, speed: float = 1.0,
-               speak: Speak = default_speak, log=print) -> dict:
+               speak: Speak = default_speak, log=print, force: set[str] | None = None, loose: bool = False) -> dict:
+    """force：这些句子（<beat>-<index>）不管缓存重合成；loose 见 synth_line。"""
     if not beat.sentences:
         return {}
     parts = [
-        _speed(synth_line(out_dir / "lines", f"{beat.id}-{s.index}", s.pace, s.spoken, persona, model, voice, speak, log), speed)
+        _speed(synth_line(out_dir / "lines", f"{beat.id}-{s.index}", s.pace, s.spoken, persona, model, voice, speak, log,
+                          force=f"{beat.id}-{s.index}" in (force or set()), loose=loose), speed)
         for s in beat.sentences
     ]
     cues, cursor, inputs, filters = [], LEAD, [], []

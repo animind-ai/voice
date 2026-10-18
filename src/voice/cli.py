@@ -2,9 +2,11 @@
 
     animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0]
     animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型]
+    animind-voice pitch SPEC --audio 音频目录 [--fix --env 密钥文件]
 
 synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
+pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
 """
 
 from __future__ import annotations
@@ -36,10 +38,19 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--backend", choices=["mlx", "faster"], help="听写后端；默认 macOS 用 mlx，其他平台用 faster(-whisper)，或取 ANIMIND_ALIGN_BACKEND")
     a.add_argument("--model", default=None, help="默认按后端取 whisper-large-v3-turbo 的对应版本")
     a.add_argument("--only", nargs="*", default=[])
+    p = sub.add_parser("pitch", help="逐句测音高，找出像换了声音的句子；--fix 只重合成这些句子")
+    p.add_argument("spec", type=Path)
+    p.add_argument("--audio", type=Path, required=True)
+    p.add_argument("--fix", action="store_true", help="重合成异常句（要 --env），之后要重新 align")
+    p.add_argument("--env", type=Path)
+    p.add_argument("--only", nargs="*", default=[])
     args = parser.parse_args(argv)
 
     doc = load_file(args.spec)
     beats = [b for b in script.beats(doc) if not args.only or b.id in args.only]
+
+    if args.command == "pitch":
+        return pitch_command(doc, beats, args)
 
     if args.command == "synth":
         from . import synth
@@ -86,6 +97,57 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ⚠ {beat.id}[{r.key}] 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}{sure}\n    听到：{r.heard}")
     print(f"完成；需要回听 {flagged} 句")
     return 0
+
+
+def pitch_command(doc: dict, beats: list, args) -> int:
+    import json
+
+    from . import pitch, synth
+
+    def measure() -> dict[str, tuple[float, str, str, bool]]:
+        rows = {}
+        for beat in beats:
+            for s in beat.sentences:
+                name = f"{beat.id}-{s.index}"
+                wav, stamp = args.audio / "lines" / f"{name}.wav", args.audio / "lines" / f"{name}.json"
+                if not wav.exists() or not stamp.exists():
+                    continue
+                meta = json.loads(stamp.read_text(encoding="utf-8"))
+                f0 = pitch.median_f0(wav)
+                rows[name] = (f0, meta["voice"], meta["model"], pitch.off_voice(f0, meta["voice"]))
+        return rows
+
+    rows = measure()
+    if not rows:
+        print(f"{args.audio} 里没有合成好的句子", file=sys.stderr)
+        return 2
+    f0s = sorted(r[0] for r in rows.values() if r[0])
+    bad = [n for n, r in rows.items() if r[3]]
+    print(f"{len(rows)} 句，音高中位 {f0s[len(f0s) // 2]:.0f} Hz，像换了声音的 {len(bad)} 句")
+    for name in bad:
+        print(f"  ⚠ {name} {rows[name][0]:.0f} Hz（声音 {rows[name][1]}）")
+    if not bad or not args.fix:
+        return 1 if bad else 0
+
+    synth.load_env(args.env)
+    persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
+    speed = float(doc.get("style", {}).get("voice", {}).get("speed", 1.0))
+    log_path = args.audio / "tts_usage.jsonl"
+    before = synth.total_cost(log_path)
+    for beat in beats:
+        names = {f"{beat.id}-{s.index}" for s in beat.sentences} & set(bad)
+        if not names:
+            continue
+        _, voice, model, _ = rows[sorted(names)[0]]
+        os.environ["GEMINI_TTS_VOICE"] = voice
+        synth.synth_beat(beat, args.audio, persona, model, voice, speed, force=names, loose=True)
+    after = synth.total_cost(log_path)
+    fixed = measure()
+    still = [n for n in bad if fixed[n][3]]
+    for name in bad:
+        print(f"  {name}: {rows[name][0]:.0f} → {fixed[name][0]:.0f} Hz{'（仍异常）' if name in still else ''}")
+    print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；重合成的段要重新 align，再回听新句子")
+    return 1 if still else 0
 
 
 if __name__ == "__main__":

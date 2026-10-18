@@ -165,3 +165,65 @@ def test_faster_output_matches_mlx_shape(monkeypatch):
     assert text == "一二三" and seen["initial_prompt"] is None and seen["word_timestamps"]
     assert [w["word"] for w in words] == ["一", "二", "三"] and words[2]["start"] == 0.4
     assert textalign.align("一二三", textalign.chars_from_words(words)).ratio == 1.0
+
+
+def hz_tone(freq: float, seconds: float = 0.6, rate: int = 24000) -> bytes:
+    n = int(seconds * rate)
+    return b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * freq * k / rate))) for k in range(n))
+
+
+def test_pitch_tells_low_voice_from_high(tmp_path):
+    from voice import pitch
+
+    for freq in (120, 210):
+        synth._to_wav(hz_tone(freq), tmp_path / f"{freq}.wav")
+    low, high = pitch.median_f0(tmp_path / "120.wav"), pitch.median_f0(tmp_path / "210.wav")
+    assert abs(low - 120) < 6 and abs(high - 210) < 10
+    assert pitch.off_voice(low, "Kore") and not pitch.off_voice(high, "Kore")
+    assert pitch.off_voice(high, "Puck") and not pitch.off_voice(low, "Puck")
+    assert not pitch.off_voice(low, "unknown-voice")  # 不认识的声音不做判断
+
+
+def test_synth_retries_when_voice_changes(tmp_path):
+    takes = iter([hz_tone(120), hz_tone(210)])
+    calls = []
+
+    def speak(instructions, text, model):
+        calls.append(instructions)
+        return next(takes)
+
+    wav = synth.synth_line(tmp_path / "lines", "B-0", "normal", "一句话。", "teacher-hs", "fake/model", "Kore",
+                           speak=speak, log=lambda *_: None)
+    from voice import pitch
+
+    assert len(calls) == 2  # 第一次像男声，重合成一次
+    assert pitch.median_f0(wav) > pitch.FEMALE_FLOOR
+    assert synth.STEADY in calls[0]
+    assert len((tmp_path / "tts_usage.jsonl").read_text().splitlines()) == 2  # 两次都记账
+
+
+def test_synth_keeps_closest_take_after_retries(tmp_path):
+    takes = iter([hz_tone(110), hz_tone(140), hz_tone(120)])
+    synth.synth_line(tmp_path / "lines", "B-0", "normal", "一句话。", "teacher-hs", "fake/model", "Kore",
+                     speak=lambda *a: next(takes), log=lambda *_: None)
+    from voice import pitch
+
+    assert abs(pitch.median_f0(tmp_path / "lines" / "B-0.wav") - 140) < 8
+
+
+def test_loose_cache_ignores_changed_instructions(tmp_path):
+    calls = []
+
+    def speak(instructions, text, model):
+        calls.append(text)
+        return tone(0.5)
+
+    beat = script.beats({"beats": [{"id": "B", "say": [
+        {"pace": "normal", "text": "第一句。"}, {"pace": "normal", "text": "第二句。"}]}]})[0]
+    synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=speak, log=lambda *_: None)
+    stamp = tmp_path / "lines" / "B-0.json"
+    old = json.loads(stamp.read_text())
+    stamp.write_text(json.dumps(dict(old, instructions="旧的人设"), ensure_ascii=False))
+    synth.synth_beat(beat, tmp_path, "teacher-hs", "fake/model", "v", speak=speak, log=lambda *_: None,
+                     force={"B-1"}, loose=True)
+    assert calls == ["第一句。", "第二句。", "第二句。"]  # 只重念强制的那句，旧人设的第一句沿用缓存
