@@ -2,8 +2,9 @@
 
 流程沿用 highSchool/lessons/sec6-7/kit/narrate.py：
 - 模型名带 "/"（例如 google/gemini-3.8-flash-tts）走 OpenRouter，风格提示放在 instructions；否则走 Vertex；
-- 句间停顿按语气（normal / brisk / slow / ask），开头留 0.3 秒；
-- speed ≠ 1 时用 ffmpeg atempo 变速（不变调），原声缓存不受影响。
+- 句间静音按句末标点（scene_spec.silence_after，say[].hold 可覆盖），开头留 0.3 秒，最后一句之后不留；
+- speed ≠ 1 时用 ffmpeg atempo 只把人声变速（不变调，原声缓存不受影响），静音不随语速缩放，
+  所以 timing.json 的 cues 之间的间隔就是 silence_after，scene_spec 的 SS487 能直接比。
 
 密钥只从环境变量读（--env 指向的文件会被加载进环境），从不打印。
 """
@@ -15,6 +16,8 @@ import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+
+from scene_spec import silence_after
 
 from . import pitch
 from .audio import wav_seconds
@@ -56,7 +59,6 @@ PACE_EN = {
 VERBATIM_EN = "Read the script exactly as written: add nothing, drop nothing, no filler words like \"um\", \"uh\" or \"so\" that aren't in it."
 STEADY_EN = "Keep the same voice throughout: same timbre and pitch from start to finish."
 LANGUAGE_CODE = {"zh": "zh-CN", "en": "en-US"}
-GAP = {"normal": 0.35, "brisk": 0.25, "slow": 0.6, "ask": 0.55}
 # 单价（美元）：OpenRouter 上 google/gemini-3.8-flash-tts 输入 $0.5/百万 token、输出 $9/百万 token；
 # Gemini 音频输出按 25 token/秒计，约 $0.0135/分钟。价格变了就改这里。
 PRICE_INPUT_PER_TOKEN = 0.5e-6
@@ -229,7 +231,7 @@ def synth_beat(beat: Beat, out_dir: Path, persona: str, model: str, voice: str, 
     for k, (s, part) in enumerate(zip(beat.sentences, parts)):
         seconds = wav_seconds(part)
         cues.append({"start": round(cursor, 3), "end": round(cursor + seconds, 3)})
-        gap = GAP[s.pace] / speed if k + 1 < len(parts) else 0.0
+        gap = round(silence_after(s.text, s.hold), 3) if k + 1 < len(parts) else 0.0
         inputs += ["-i", str(part)]
         filters.append(f"[{k}:a]apad=pad_dur={gap:.3f}[a{k}]")
         cursor += seconds + gap

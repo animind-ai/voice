@@ -9,9 +9,11 @@ normalize 保留书签，所以书签位置在展开之后再算，自然指向�
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
+from scene_spec import pauses
 from zh_math_reading import lint, normalize
 
 _BOOKMARK = re.compile(r"\{@([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -27,6 +29,7 @@ class Sentence:
     spoken: str  # normalize 之后、去掉书签的读法文本（送给 TTS 的就是它）
     marks: dict[str, int] = field(default_factory=dict)  # 书签 → spoken 里的字符位置
     lang: str = "zh"
+    hold: float | None = None  # say[].hold：这句之后的静音（秒），已按 pauses.hold_in_range 校验
 
     @property
     def key(self) -> str:
@@ -62,6 +65,20 @@ def _tidy(spoken: str, marks: dict[str, int]) -> tuple[str, dict[str, int]]:
     return text, {name: sum(1 for k in keep if k < pos) for name, pos in marks.items()}
 
 
+def parse_hold(sentence: dict, where: str) -> float | None:
+    """say[].hold：没写返回 None；写了就必须是有限数，并落在句末标点的允许区间里。"""
+    if "hold" not in sentence:
+        return None
+    hold = sentence["hold"]
+    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold):
+        raise ValueError(f"{where}.hold 应为有限秒数，收到 {hold!r}")
+    if not pauses.hold_in_range(sentence["text"], hold):
+        default, lo, hi = pauses.range_for(sentence["text"])
+        raise ValueError(
+            f"{where}.hold 应在 {lo:g}–{hi:g} 秒之间（{pauses.classify(sentence['text'])} 默认 {default:g}），收到 {hold:g}")
+    return float(hold)
+
+
 def lang(doc: dict) -> str:
     return doc.get("style", {}).get("lang", "zh")
 
@@ -71,10 +88,11 @@ def beats(doc: dict) -> list[Beat]:
     for beat in doc["beats"]:
         sentences = []
         for i, s in enumerate(beat.get("say", [])):
+            hold = parse_hold(s, f"beats[{beat['id']}].say[{i}]")
             text = normalize(s["text"]) if language == "zh" else " ".join(s["text"].split())
             spoken, marks = split_marks(text)
             if language != "zh":
                 spoken, marks = _tidy(spoken, marks)
-            sentences.append(Sentence(beat["id"], i, s.get("id"), s["pace"], s["text"], spoken, marks, language))
+            sentences.append(Sentence(beat["id"], i, s.get("id"), s["pace"], s["text"], spoken, marks, language, hold))
         out.append(Beat(beat["id"], sentences))
     return out
