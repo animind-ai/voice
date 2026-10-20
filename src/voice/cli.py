@@ -3,11 +3,13 @@
     animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0] [--lang en]
     animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型] [--lang en]
     animind-voice pitch SPEC --audio 音频目录 [--fix --env 密钥文件] [--lang en]
+    animind-voice review EPISODE.mp4 [--spec SPEC] [--audio 音频目录] [--env 密钥文件] [--model M] [--out 报告.json]
 
 synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
---lang en 念英文版（每句的 en，书签写在 en 里；见 scene_spec.localize），三个命令要用同一个 --lang 和音频目录。
+review 把成片（可带场景稿和 timing）交给 Gemini 看画面和声音，写出 JSON 报告和一份短 Markdown。退出码：0 通过，1 未通过，2 用法或调用失败。
+--lang en 念英文版（每句的 en，书签写在 en 里；见 scene_spec.localize）。synth / align / pitch 要用同一个 --lang 和音频目录；review 用它读场景稿。
 """
 
 from __future__ import annotations
@@ -48,7 +50,26 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", nargs="*", default=[])
     for cmd in (s, a, p):
         cmd.add_argument("--lang", choices=["zh", "en"], default="zh", help="念哪种语言的版本，默认中文")
+    r = sub.add_parser("review", help="用 Gemini 看整集成片，写出审片报告")
+    r.add_argument("video", type=Path, help="成片，通常是 mp4")
+    r.add_argument("--spec", type=Path, help="这一集的 scene-spec；有的话会把旁白和书签附给模型")
+    r.add_argument("--audio", type=Path, help="synth/align 的输出目录，读取 <beat>.timing.json")
+    r.add_argument("--env", type=Path, help="含 GEMINI_API_KEY 或 GOOGLE_* 的文件；不会打印其内容")
+    r.add_argument("--model", help="默认 GEMINI_REVIEW_MODEL，否则 gemini-4-argon")
+    r.add_argument("--out", type=Path, help="报告 JSON 的路径，或一个目录；默认写在视频旁边")
+    r.add_argument("--thresholds", type=Path, help="JSON，覆盖通过/失败阈值")
+    r.add_argument("--max-chunk-seconds", type=float, default=300, help="超过这个长度就切段，默认 300 秒")
+    r.add_argument("--overlap-seconds", type=float, default=8, help="相邻段重叠的秒数，默认 8")
+    r.add_argument("--media-resolution", choices=["low", "high"], default="high", help="数学画面默认 high，便于读字")
+    r.add_argument("--media-processing", choices=["static", "agentic"], default="static",
+                   help="static 逐秒看画面；agentic 更省 token，可能漏掉布局问题")
+    r.add_argument("--attempts", type=int, default=3, help="遇到 429 或 5xx 时一次请求最多试几次")
+    r.add_argument("--prompt-version", default="v1", help="提示词目录的版本，默认 v1")
+    r.add_argument("--lang", choices=["zh", "en"], default="zh", help="场景稿用哪种语言，默认中文")
     args = parser.parse_args(argv)
+
+    if args.command == "review":
+        return review_command(args)
 
     doc = localize(load_file(args.spec), args.lang)
     beats = [b for b in script.beats(doc) if not args.only or b.id in args.only]
@@ -101,6 +122,46 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ⚠ {beat.id}[{r.key}] 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}{sure}\n    听到：{r.heard}")
     print(f"完成；需要回听 {flagged} 句")
     return 0
+
+
+def review_command(args) -> int:
+    from . import review, synth
+
+    synth.load_env(args.env)
+    model = args.model or os.environ.get("GEMINI_REVIEW_MODEL") or review.DEFAULT_MODEL
+    out_json = _review_out(args.video, args.out)
+    try:
+        thresholds = review.load_thresholds(args.thresholds)
+        reviewer = review.default_reviewer(
+            model, resolution=args.media_resolution, processing=args.media_processing, attempts=args.attempts)
+        log_path = out_json.parent / "review_usage.jsonl"
+        report = review.review_episode(
+            args.video, reviewer=reviewer, out_json=out_json, model=model, spec=args.spec, audio=args.audio,
+            lang=args.lang, thresholds=thresholds, max_chunk_seconds=args.max_chunk_seconds,
+            overlap_seconds=args.overlap_seconds, prompt_version=args.prompt_version,
+        )
+    except review.ReviewError as exc:
+        print(review.redact(str(exc)), file=sys.stderr)
+        log_path = out_json.parent / "review_usage.jsonl"
+        if log_path.exists():
+            calls, usd = review.total_usage(log_path)
+            print(f"已经记下来的调用在 {log_path}（累计 {calls} 次，约 ${usd:.4f}）", file=sys.stderr)
+        return 2
+    after = review.total_usage(out_json.parent / "review_usage.jsonl")
+    status = "通过" if report["passed"] else "未通过"
+    print(f"{args.video.name}: {status}（{report['usage']['calls']} 次模型调用，约 ${report['usage']['est_usd']:.4f}）")
+    usage = report["usage"]
+    print(f"这次调用 {usage['calls']} 次，约 ${usage['est_usd']:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
+    print(out_json.with_suffix(".md").read_text(encoding="utf-8"))
+    return 0 if report["passed"] else 1
+
+
+def _review_out(video: Path, out: Path | None) -> Path:
+    if out is None:
+        return video.with_name(video.stem + ".review.json")
+    if out.suffix.lower() == ".json":
+        return out
+    return out / f"{video.stem}.review.json"
 
 
 def pitch_command(doc: dict, beats: list, args) -> int:

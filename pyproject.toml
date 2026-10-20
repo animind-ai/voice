@@ -1,7 +1,7 @@
 [project]
 name = "animind-voice"
 version = "0.1.0"
-description = "scene-spec 的旁白流水线：分句合成、Whisper 书签对齐、回听检查"
+description = "scene-spec 的旁白流水线：分句合成、Whisper 书签对齐、回听检查、成片审片"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Boxi Yu" }]
@@ -16,6 +16,7 @@ dependencies = [
 align = ["mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 align-cuda = ["faster-whisper>=1.1"]  # Linux / CUDA；1.1 起有 large-v3-turbo
 vertex = ["google-genai>=1.0"]
+review = ["google-genai>=1.0"]
 
 [project.scripts]
 animind-voice = "voice.cli:main"

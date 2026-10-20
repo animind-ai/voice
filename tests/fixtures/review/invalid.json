@@ -1,0 +1,13 @@
+{
+  "summary": "有一条类别写错了。",
+  "issues": [
+    {
+      "category": "overlapping-text",
+      "severity": "major",
+      "start": 1,
+      "end": 2,
+      "evidence": "字叠在一起。",
+      "suggested_fix": "挪开。"
+    }
+  ]
+}

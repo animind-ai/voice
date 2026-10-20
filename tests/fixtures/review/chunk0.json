@@ -1,0 +1,25 @@
+{
+  "summary": "标题和题卡叠在一起，旁白讲到二阶差时画面还停在一阶。",
+  "issues": [
+    {
+      "category": "layout_overlap",
+      "severity": "major",
+      "start": 12.4,
+      "end": 15.8,
+      "evidence": "标题「高阶等差数列」压在题卡第一行上，两行字叠在一起。",
+      "suggested_fix": "把题卡下移，标题单独留在画面上方。",
+      "beat": "Opening",
+      "sentence": "s1"
+    },
+    {
+      "category": "av_sync",
+      "severity": "major",
+      "start": 292.2,
+      "end": 296.0,
+      "evidence": "旁白已经在说二阶差数列，高亮还停在一阶差那一行。",
+      "suggested_fix": "把二阶差高亮提前到这句的书签时刻。",
+      "beat": "Method",
+      "sentence": "s2"
+    }
+  ]
+}

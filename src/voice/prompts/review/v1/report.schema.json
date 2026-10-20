@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://animind.ai/schemas/review-report-v1.json",
+  "title": "animind episode review report v1",
+  "description": "Written by animind-voice review. scene-spec (or a later pipeline gate) should read `gate`, which has the same shape as scene_spec.report.Report.to_dict(): ok, issues[{level, code, path, message}], stats. ok is false when the episode fails the configured thresholds. level is error for a failing item and warning otherwise. path is t=<start>-<end> in seconds on the full episode timeline. `gate` is not the input to scene-spec check_timing, which expects {beats: ...} (narration and bookmark times). Do not pass `gate` or this report into check_timing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "prompt_version",
+    "episode",
+    "model",
+    "duration_s",
+    "passed",
+    "ok",
+    "summary",
+    "thresholds",
+    "counts",
+    "issues",
+    "gate",
+    "usage",
+    "chunks"
+  ],
+  "properties": {
+    "schema": {"const": "animind.review/v1"},
+    "prompt_version": {"type": "string"},
+    "episode": {"type": "string"},
+    "episode_id": {"type": ["string", "null"]},
+    "title": {"type": ["string", "null"]},
+    "model": {"type": "string"},
+    "duration_s": {"type": "number", "minimum": 0},
+    "passed": {"type": "boolean"},
+    "ok": {"type": "boolean"},
+    "summary": {"type": "string"},
+    "thresholds": {"type": "object"},
+    "counts": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "issues": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/reportIssue"}
+    },
+    "gate": {"$ref": "#/$defs/gate"},
+    "usage": {"$ref": "#/$defs/usage"},
+    "chunks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/chunk"}
+    },
+    "sources": {"type": "object"}
+  },
+  "$defs": {
+    "reportIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "category", "code", "severity", "start", "end", "evidence", "suggested_fix", "chunk"],
+      "properties": {
+        "id": {"type": "string"},
+        "category": {"type": "string"},
+        "code": {"type": "string", "pattern": "^RV[0-9]{3}$"},
+        "severity": {"enum": ["info", "minor", "major", "blocker"]},
+        "start": {"type": "number", "minimum": 0},
+        "end": {"type": "number", "minimum": 0},
+        "evidence": {"type": "string", "minLength": 1},
+        "suggested_fix": {"type": "string", "minLength": 1},
+        "chunk": {"type": "integer", "minimum": 0},
+        "beat": {"type": "string"},
+        "sentence": {"type": "string"}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "issues", "stats"],
+      "properties": {
+        "ok": {"type": "boolean"},
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["level", "code", "path", "message"],
+            "properties": {
+              "level": {"enum": ["error", "warning"]},
+              "code": {"type": "string"},
+              "path": {"type": "string"},
+              "message": {"type": "string"}
+            }
+          }
+        },
+        "stats": {"type": "object"}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calls", "input_tokens", "output_tokens", "est_usd", "log"],
+      "properties": {
+        "calls": {"type": "integer", "minimum": 0},
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0},
+        "est_usd": {"type": "number", "minimum": 0},
+        "log": {"type": "string"}
+      }
+    },
+    "chunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "start", "end", "calls"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "start": {"type": "number", "minimum": 0},
+        "end": {"type": "number", "minimum": 0},
+        "calls": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}
