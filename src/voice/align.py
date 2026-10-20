@@ -19,9 +19,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import heard, textalign
+from . import heard, policy, textalign
 from .audio import slice_16k
 from .script import Beat, Sentence
+from .ttscache import write_text_atomic
+
+
+class Inconsistent(ValueError):
+    """这一段的 wav、timing.json 和发布说明对不上（policy.check_beat），不能对齐。"""
+
 
 BACKENDS = ("mlx", "faster")
 DEFAULT_MODELS = {
@@ -43,6 +49,9 @@ class SentenceResult:
     confirmed: list[str] | None = None  # 复核后仍然缺的字；None 表示没复核
     words: list[list[float]] = field(default_factory=list)  # [[稿子里第几个字（词首）, 时刻], ...]，只记精确匹配上的
     content: int = 0  # 稿子里参与对齐的字数
+    index: int = 0  # 这句在 beat 的 say 里的下标
+    start: float = 0.0  # 这句在 beat 音频里的起止（timing.json 的 cue）
+    end: float = 0.0
 
     @property
     def suspicious(self) -> bool:
@@ -243,6 +252,10 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
         return []
     if not timing_path.exists() or not wav.exists():
         raise FileNotFoundError(f"{beat.id}：缺少 {wav.name} 或 {timing_path.name}，先运行 synth")
+    check = policy.check_beat(audio_dir, beat.id)
+    if not check.clean:  # 按对不上 wav 的 cues 去切音频，书签时刻全是错的
+        raise Inconsistent(f"{beat.id}：{check.describe()}，不对齐。"
+                           f"先运行 synth（能修的会按发布说明修好；修不好的要重合成：synth --only {beat.id}）")
     timing = json.loads(timing_path.read_text(encoding="utf-8"))
     cues = timing["cues"]
     if len(cues) != len(beat.sentences):
@@ -250,6 +263,7 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
     results = []
     for sentence, cue in zip(beat.sentences, cues):
         r = align_sentence(sentence, wav, cue["start"], cue["end"], model, transcriber)
+        r.index, r.start, r.end = sentence.index, cue["start"], cue["end"]
         raw = audio_dir / "lines" / f"{beat.id}-{sentence.index}.wav"
         if r.suspicious and raw.exists():
             r.confirmed = confirm(sentence, raw, model, transcriber)
@@ -260,7 +274,7 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
     timing["words"] = {r.key: {"n": r.content, "at": r.words} for r in results if r.words}
     timing["how"] = {r.key: r.how for r in results if r.how}  # 每个书签：matched / interpolated / estimated
     timing["aligner"] = model
-    timing_path.write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_text_atomic(timing_path, json.dumps(timing, ensure_ascii=False, indent=1))
     flagged = [r.key for r in results if r.flagged]
     est = sum(1 for r in results for h in r.how.values() if h != "matched")
     log(f"{beat.id}: {len(results)} 句，书签 {sum(len(r.marks) for r in results)} 个（精确匹配率 {match_rate(results):.0%}，非精确匹配 {est}），需要回听 {flagged or '无'}")
@@ -271,3 +285,25 @@ def match_rate(results: list[SentenceResult]) -> float:
     """书签里精确匹配（matched）的比例；没有书签时为 1。"""
     hows = [h for r in results for h in r.how.values()]
     return sum(h == "matched" for h in hows) / len(hows) if hows else 1.0
+
+
+def warnings(results: list[SentenceResult], refs: dict | None, beat_id: str) -> list[str]:
+    """要人看的提示，每条带场景文件里的位置：beats[2].say[1] (line 37, t=12.300-15.800)。t 是 beat 音频里的时刻。
+
+    书签不是逐字配上的（interpolated / estimated）各一条；需要回听的句子（漏念、多念、像幻觉）一条。
+    refs 是 trace.scene_refs 的结果；没有就只写 beat 和句子的键。
+    """
+    from .trace import describe
+
+    beat = (refs or {}).get(beat_id)
+    out = []
+    for r in results:
+        ref = next((say for say in beat.says if say.index == r.index), None) if beat else None
+        where = describe(ref, r.start, r.end) if ref else f"{beat_id}[{r.key}] (t={r.start:.3f}-{r.end:.3f})"
+        for name, how in r.how.items():
+            if how != "matched":
+                out.append(f"{where}: 书签 {{@{name}}} {'插值' if how == 'interpolated' else '估算'}（{how}）在 {r.marks[name]:.3f}s，请核对")
+        if r.flagged:
+            sure = f"；复核仍缺 {r.confirmed}" if r.confirmed else "（没有原始单句音频，未复核）"
+            out.append(f"{where}: 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}{sure}\n    听到：{r.heard}")
+    return out

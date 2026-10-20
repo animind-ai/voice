@@ -495,7 +495,7 @@ def project_gate(issues: list[dict], thresholds: dict, violations: list[str]) ->
         gate_issues.append({
             "level": "error" if failing else "warning",
             "code": issue["code"],
-            "path": f"t={issue['start']:.3f}-{issue['end']:.3f}",
+            "path": issue.get("path") or f"t={issue['start']:.3f}-{issue['end']:.3f}",
             "message": f"{prefix}{issue['category']}: {issue['evidence']} 建议：{issue['suggested_fix']}",
         })
     for violation in violations:
@@ -503,6 +503,89 @@ def project_gate(issues: list[dict], thresholds: dict, violations: list[str]) ->
         stats["threshold"] = stats.get("threshold", 0) + 1
     ok = not any(item["level"] == "error" for item in gate_issues)
     return {"ok": ok, "issues": gate_issues, "stats": stats}
+
+
+def _say_in(beat, given: str):
+    return next((say for say in beat.says if given in (say.key, str(say.index))), None) if beat else None
+
+
+def trace_issues(issues: list[dict], refs: dict, timeline) -> None:
+    """就地给每条问题补上它在场景文件里的位置：beat、sentence、line、column、path（见 README「追溯到场景文件」）。
+
+    按问题的整集时间 [start, end] 在 timeline 上找重叠最多的那句旁白；落在两句之间、pause 里、没有旁白的 beat 里
+    只对到 beat（line 是这个 beat 的 id 那一行）；不在任何 beat 里就不动。
+    模型自己填了 beat / sentence 的，一律保留模型的值（它看过画面；时间轴在没有 chapters.json 时只是估计），
+    line / path 指向模型说的那个位置；和时间轴对不上、或者场景里没有这个 beat / 句子，就在 trace_note 里写明。
+    """
+    from .trace import describe
+
+    def check_sentence(say_ref, found_say) -> str | None:
+        """模型给的句子和时间轴（已经对上了同一个 beat）比：时间落在别的句子里，或者落在句间静音 / 暂停里。"""
+        if found_say is not None:
+            if say_ref is found_say:
+                return None
+            return f"时间落在 {describe(found_say)}，和模型给的句子不一致；保留模型的"
+        span = timeline.span_of(say_ref) if timeline else None
+        if span is None:  # 这句没有音频，不知道它的时间窗
+            return None
+        return (f"时间不在 {describe(say_ref, span.start, span.end)} 的旁白时间窗里，落在这个 beat 的句间静音或暂停里；"
+                f"保留模型的")
+
+    for issue in issues:
+        located_beat, located_say = timeline.locate(issue["start"], issue["end"]) if timeline else (None, None)
+        found_beat = located_beat.ref if located_beat else None
+        found_say = located_say.ref if located_say else None
+        given_beat, given_say = issue.get("beat"), issue.get("sentence")
+        notes = []
+        if not given_beat:
+            beat_ref, say_ref = found_beat, found_say
+            if given_say and beat_ref:  # 只给了句子：在时间对上的 beat 里找
+                say_ref = _say_in(beat_ref, given_say)
+                if say_ref is None:
+                    notes.append(f"模型给的句子 {given_say!r} 不在 {beat_ref.id} 里")
+                elif note := check_sentence(say_ref, found_say):
+                    notes.append(note)
+        else:
+            beat_ref = refs.get(given_beat)
+            agrees = beat_ref is not None and (found_beat is None or found_beat.id == beat_ref.id)
+            if beat_ref is None:
+                notes.append(f"场景里没有模型给的 beat {given_beat!r}")
+            elif not agrees:
+                notes.append(f"时间落在 {describe(found_say or found_beat)}，和模型给的 beat {given_beat} 不一致；保留模型的")
+            if given_say:
+                say_ref = _say_in(beat_ref, given_say)
+                if beat_ref is not None and say_ref is None:
+                    notes.append(f"模型给的句子 {given_say!r} 不在 {beat_ref.id} 里")
+                elif say_ref is not None and found_beat is not None and agrees:
+                    if note := check_sentence(say_ref, found_say):
+                        notes.append(note)
+            else:
+                say_ref = found_say if agrees else None
+        where = say_ref or beat_ref
+        if beat_ref and not given_beat:
+            issue["beat"] = beat_ref.id
+        if say_ref and not given_say:
+            issue["sentence"] = say_ref.key
+        if where is not None:
+            if where.line is not None:
+                issue["line"], issue["column"] = where.line, where.column
+            issue["path"] = describe(where, issue["start"], issue["end"])
+        if notes:
+            issue["trace_note"] = "；".join(notes)[:300]
+
+
+def episode_timeline(spec: Path | None, audio: Path | None, chapters: Path | None, lang: str):
+    """(refs, timeline)：场景文件里每个 beat / 句子的位置，和它们在成片上的时间（见 trace.py）。没有 spec 就是 ({}, None)。"""
+    if spec is None:
+        return {}, None
+    from scene_spec import localize
+    from scene_spec.loader import load_file
+
+    from .trace import build_timeline, scene_refs
+
+    doc = localize(load_file(spec), lang)
+    refs = scene_refs(doc, spec, lang)
+    return refs, build_timeline(refs, audio, chapters, doc)
 
 
 def render_user(template: str, **values: str) -> str:
@@ -546,7 +629,11 @@ def render_markdown(report: dict) -> str:
         lines.append("")
         for issue in report["issues"]:
             where = f"{_fmt_clock(issue['start'])}–{_fmt_clock(issue['end'])}"
+            if issue.get("line"):
+                where += f" · `{issue['path'].split(' ', 1)[0]}` 第 {issue['line']} 行"
             lines.append(f"- **{issue['severity']}** `{issue['category']}` `{issue['code']}` {where}")
+            if issue.get("trace_note"):
+                lines.append(f"  （{issue['trace_note']}）")
             lines.append(f"  {issue['evidence']}")
             lines.append(f"  建议：{issue['suggested_fix']}")
         lines.append("")
@@ -668,6 +755,7 @@ def review_episode(
     model: str,
     spec: Path | None = None,
     audio: Path | None = None,
+    chapters: Path | None = None,
     lang: str = "zh",
     thresholds: dict | None = None,
     max_chunk_seconds: float = DEFAULT_MAX_CHUNK_SECONDS,
@@ -679,7 +767,10 @@ def review_episode(
     today: date | None = None,
     log=print,
 ) -> dict:
-    """审完一整集，写出 JSON 和同名 Markdown。reviewer(video, system, user, chunk) -> Turn。"""
+    """审完一整集，写出 JSON 和同名 Markdown。reviewer(video, system, user, chunk) -> Turn。
+
+    chapters：kit 写的 <成片>.chapters.json，默认取视频旁边的同名文件；有 spec 时用它把问题追溯到场景文件的行。
+    """
     if schema_attempts < 1:
         raise ReviewError("schema 重试次数至少为 1")
     probe = probe or probe_duration
@@ -692,6 +783,9 @@ def review_episode(
     thresholds = thresholds or load_thresholds(None)
     system, user_template, schema = load_prompt(prompt_version)
     context, episode_id, title = build_context(spec, audio, lang)
+    if chapters is None and video.with_suffix(".chapters.json").exists():
+        chapters = video.with_suffix(".chapters.json")
+    refs, timeline = episode_timeline(spec, audio, chapters, lang)
     duration = probe(video)
     chunks = plan_chunks(duration, max_chunk_seconds, overlap_seconds)
     schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
@@ -757,6 +851,7 @@ def review_episode(
     for number, issue in enumerate(merged, start=1):
         issue["id"] = f"i{number}"
         issue["code"] = CATEGORY_CODE[issue["category"]]
+    trace_issues(merged, refs, timeline)
     passed, violations = decide(merged, thresholds)
     gate = project_gate(merged, thresholds, violations)
     counts = {name: sum(1 for issue in merged if issue["severity"] == name) for name in SEVERITIES}
@@ -793,6 +888,8 @@ def review_episode(
             "video": str(video),
             "spec": str(spec) if spec else None,
             "audio": str(audio) if audio else None,
+            "chapters": str(chapters) if chapters and timeline and timeline.source == "chapters" else None,
+            "timeline": timeline.source if timeline else None,
             "prompt_version": prompt_version,
         },
     }
