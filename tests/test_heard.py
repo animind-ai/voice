@@ -461,3 +461,63 @@ def test_percent_split_across_words_spreads_over_the_whole_span(split_at):
     assert "".join(c.ch for c in chars) == "百分之二十五"
     assert [round(c.start, 6) for c in chars] == pytest.approx([i * 2 / 6 for i in range(6)])
     assert chars[-1].end == pytest.approx(2.0)
+
+
+# ---------- 第四轮：整个式子是一个听写词时，词的时间段平均分给全部读法字 ----------
+
+def _table(chars):
+    return [(c.ch, round(c.start, 6), round(c.end, 6)) for c in chars]
+
+
+def _even(reading, t0=0.0, t1=1.0):
+    n = len(reading)
+    return [(ch, round(t0 + (t1 - t0) * k / n, 6), round(t0 + (t1 - t0) * (k + 1) / n, 6)) for k, ch in enumerate(reading)]
+
+
+@pytest.mark.parametrize("word, reading", [
+    ("a=b", "a等于b"),
+    ("x+y", "x加y"),
+    ("x²", "x的平方"),
+    ("1/2", "二分之一"),
+    ("25%", "百分之二十五"),
+    ("-3", "负三"),
+])
+def test_whole_expression_in_one_word_spreads_evenly_over_its_reading(word, reading):
+    """整个式子是一个词 [0,1]：读法字逐字平分（a 等 于 b 各 1/4），式子里的字母不固定在原字的位置上。"""
+    assert _table(heard.chars_from_words([{"word": word, "start": 0.0, "end": 1.0}])) == _even(reading)
+
+
+def test_bookmark_inside_a_one_word_expression_gets_the_spoken_time(no_audio):
+    """“$a={@b}b$，结束。”，听写 “a=b” [0,1]：书签在 b 前面，即“a等于”三个字之后的 0.75 秒，标为 matched。"""
+    words = [{"word": "a=b", "start": 0.0, "end": 1.0}, {"word": "，结束。", "start": 1.0, "end": 1.6}]
+    res = _run("$a={@b}b$，结束。", ["a=b", "，结束。"], words=words)
+    assert res.how == {"b": "matched"}
+    assert res.marks["b"] == pytest.approx(0.75, abs=0.002)
+
+
+@pytest.mark.parametrize("x_end", [0.1, 0.25, 0.5, 0.9])
+def test_separate_letter_word_keeps_its_span_at_any_ratio(x_end):
+    """x 单独成词 [0, x_end]、“²” [x_end, 1]：x 保留自己的时间段，“的平方”平分 “²” 的时间段。"""
+    words = [{"word": "x", "start": 0.0, "end": x_end}, {"word": "²", "start": x_end, "end": 1.0}]
+    assert _table(heard.chars_from_words(words)) == [("x", 0.0, x_end)] + _even("的平方", x_end, 1.0)
+
+
+@pytest.mark.parametrize("y_start", [0.4, 0.5, 0.8])
+def test_separate_operand_words_keep_their_spans(y_start):
+    """“x” [0,0.2] + “+” [0.2, y_start] + “y” [y_start, 1]：x、y 各保留自己的词，“加”占 “+” 的时间段。"""
+    words = [{"word": "x", "start": 0.0, "end": 0.2}, {"word": "+", "start": 0.2, "end": y_start},
+             {"word": "y", "start": y_start, "end": 1.0}]
+    assert _table(heard.chars_from_words(words)) == [("x", 0.0, 0.2), ("加", 0.2, y_start), ("y", y_start, 1.0)]
+
+
+def test_mixed_words_split_each_word_over_its_own_share_of_the_reading():
+    """“a=b” [0,1] + “+c” [1,2]：第一个词平分“a等于b”，第二个词平分“加c”。"""
+    words = [{"word": "a=b", "start": 0.0, "end": 1.0}, {"word": "+c", "start": 1.0, "end": 2.0}]
+    assert _table(heard.chars_from_words(words)) == _even("a等于b") + _even("加c", 1.0, 2.0)
+
+
+def test_mixed_words_with_a_multi_char_power_word():
+    """“x^2” [0,1] + “+” [1,1.5] + “y^2” [1.5,2.5]：每个词平分来自它的读法字（x的平方 / 加 / y的平方）。"""
+    words = [{"word": "x^2", "start": 0.0, "end": 1.0}, {"word": "+", "start": 1.0, "end": 1.5},
+             {"word": "y^2", "start": 1.5, "end": 2.5}]
+    assert _table(heard.chars_from_words(words)) == _even("x的平方") + [("加", 1.0, 1.5)] + _even("y的平方", 1.5, 2.5)

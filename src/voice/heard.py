@@ -7,9 +7,11 @@
    和稿子里 `$...$` 的读法逐字相同；一元的正负号和二元的加减由 LaTeX 的上下文决定。
 2. 数字：裸数字（如 “10”、“+3”）有两种读法（中文读法，或阿拉伯数字原样）。整句做一次格子上的对齐动态规划，
    同时决定每个数字用哪种读法，使整句与稿子的读法匹配最多；不是逐个贪心地定。
-3. 时间：表达式里和读法逐字相同的字母或数字（如 “x”）保留它自己的词的时间段；插入的读法字（的平方、分之、负）
-   分在它们前后两个锚点之间的时间里；没有锚点的表达式（如 “1/2”）的字平均分在整个表达式的时间段里。
-   词的时间段按每个内容字的展开字数比例分（所以 “看1/2好” 中的 “好” 从 5/6 秒开始）。
+3. 时间：表达式的每个读法字先归到一个听写词：和原字逐字相同的字母或数字（锚点，如 “x”）归它所在的词；
+   插入的读法字（的平方、等于、分之、负）归它们来源的原字（如 “²”、“=”）所在的词，来源跨几个词时按原字数的比例分。
+   每个词在表达式里的时间段平均分给归它的读法字：单独成词的字母（“x” + “²”）保留它自己的词的时间段，
+   一个词里的整个式子（“a=b”）则逐字平分；连着几个没有锚点的词（如 “1” “/” “2”、“25” “%”）合成一段平分。
+   一个词跨几个单元时，词的时间段按每个内容字的展开字数比例分（所以 “看1/2好” 中的 “好” 从 5/6 秒开始）。
 
 表达式的边界（唯一的规则，expand 和 chars_from_words 共用）：相邻两个词里的字，只有两边都是字母或数字时才不连成一个表达式；
 时间的长短不影响表达式的语义。
@@ -204,12 +206,12 @@ def _intervals(words: list[dict], chars, units, choice) -> list[tuple[float, flo
 
 
 def _emit(units, choice, chars, ivs) -> list[HeardChar]:
-    """每个单元的内容字：和原字相同的字（锚点）保留它自己的时间段；其余的字分在锚点之间（或整个单元的时间段里）。"""
+    """每个单元的读法字分给听写词（规则见模块说明第 3 条），每个词（或连着的没有锚点的几个词）的时间段平均分给它的读法字。"""
     out: list[HeardChar] = []
     for (a, b, opts), c in zip(units, choice):
-        reading = opts[c]
-        reading_chars = [ch for ch in reading if textalign.is_content(ch)]
-        if not reading_chars:
+        reading_chars = [ch for ch in opts[c] if textalign.is_content(ch)]
+        n = len(reading_chars)
+        if not n:
             continue
         cand = [i for i in range(a, b) if _wordlike(chars[i][0])]
         matcher = difflib.SequenceMatcher(None, [chars[i][0] for i in cand], reading_chars, autojunk=False)
@@ -217,27 +219,33 @@ def _emit(units, choice, chars, ivs) -> list[HeardChar]:
         for blk in matcher.get_matching_blocks():
             for k in range(blk.size):
                 anchor[blk.b + k] = cand[blk.a + k]
-        nonzero = [ivs[i] for i in range(a, b) if ivs[i][1] > ivs[i][0]]
-        if not nonzero:
-            continue
-        lo, hi = min(s for s, _ in nonzero), max(e for _, e in nonzero)
+        owner = [chars[anchor[r]][1] if r in anchor else -1 for r in range(n)]  # 每个读法字归哪个词
         r = 0
-        while r < len(reading_chars):
+        while r < n:
             if r in anchor:
-                s, e = ivs[anchor[r]]
-                if e > s:
-                    out.append(HeardChar(reading_chars[r], s, e))
                 r += 1
                 continue
             g0 = r
-            while r < len(reading_chars) and r not in anchor:
+            while r < n and r not in anchor:
                 r += 1
-            left = ivs[anchor[g0 - 1]][1] if g0 > 0 else lo
-            right = ivs[anchor[r]][0] if r < len(reading_chars) else hi
-            n = r - g0
-            if right > left:
-                out += [HeardChar(reading_chars[g0 + k], left + (right - left) * k / n, left + (right - left) * (k + 1) / n)
-                        for k in range(n)]
+            # 这段插入的字来自前后两个锚点之间的原字；跨几个词时按原字数的比例分
+            src = [chars[i][1] for i in range(anchor[g0 - 1] + 1 if g0 > 0 else a, anchor[r] if r < n else b)]
+            src = src or [owner[g0 - 1] if g0 > 0 else owner[r]]
+            for k in range(r - g0):
+                owner[g0 + k] = src[int((k + 0.5) * len(src) / (r - g0))]
+        anchored = {chars[i][1] for i in anchor.values()}
+        chunk: dict[int, int] = {}  # 词 → 段：有锚点的词各自一段，连着的没有锚点的词合成一段
+        for wi in dict.fromkeys(chars[i][1] for i in range(a, b)):
+            prev = next(reversed(chunk), None)
+            merge = prev is not None and prev not in anchored and wi not in anchored
+            chunk[wi] = chunk[prev] if merge else len(set(chunk.values()))
+        for g in dict.fromkeys(chunk.values()):
+            span = [ivs[i] for i in range(a, b) if chunk[chars[i][1]] == g]
+            lo, hi = min(s for s, _ in span), max(e for _, e in span)
+            mine = [reading_chars[r] for r in range(n) if chunk[owner[r]] == g]
+            if hi > lo:  # 零时长的段借不到时间，不输出
+                out += [HeardChar(ch, lo + (hi - lo) * k / len(mine), lo + (hi - lo) * (k + 1) / len(mine))
+                        for k, ch in enumerate(mine)]
     return out
 
 
