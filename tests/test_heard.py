@@ -521,3 +521,54 @@ def test_mixed_words_with_a_multi_char_power_word():
     words = [{"word": "x^2", "start": 0.0, "end": 1.0}, {"word": "+", "start": 1.0, "end": 1.5},
              {"word": "y^2", "start": 1.5, "end": 2.5}]
     assert _table(heard.chars_from_words(words)) == _even("x的平方") + [("加", 1.0, 1.5)] + _even("y的平方", 1.5, 2.5)
+
+
+# ---------- 第五轮：插入的读法字归它自己的原字所在的词（不按原字数的比例分到下一个运算符） ----------
+
+@pytest.mark.parametrize("x_end", [0.5, 1.0, 2.0])
+def test_power_reading_stays_in_its_own_word_before_a_lone_operator(x_end, no_audio):
+    """“x²” [0, x_end] + “+” [x_end, x_end+1] + “y”：的平方归 “x²”，加归 “+”；书签在“加”前面 = “x²” 的终点。"""
+    words = [{"word": "x²", "start": 0.0, "end": x_end}, {"word": "+", "start": x_end, "end": x_end + 1},
+             {"word": "y", "start": x_end + 1, "end": x_end + 2}]
+    assert _table(heard.chars_from_words(words)) == (_even("x的平方", 0.0, x_end) + [("加", x_end, x_end + 1)]
+                                                     + [("y", x_end + 1, x_end + 2)])
+    words.append({"word": "，结束。", "start": x_end + 2, "end": x_end + 2.6})
+    res = _run("$x^2${@m}加$y$，结束。", ["x²", "+", "y", "，结束。"], words=words)
+    assert res.how == {"m": "matched"}
+    assert res.marks["m"] == pytest.approx(x_end, abs=0.002)
+
+
+def test_power_word_then_operator_operand_word():
+    """“x²” [0,1] + “+y” [1,2]：第一个词平分“x的平方”，第二个词平分“加y”。"""
+    words = [{"word": "x²", "start": 0.0, "end": 1.0}, {"word": "+y", "start": 1.0, "end": 2.0}]
+    assert _table(heard.chars_from_words(words)) == _even("x的平方") + _even("加y", 1.0, 2.0)
+
+
+def test_notation_powers_around_a_lone_operator():
+    """“x^2” [0,1] + “+” [1,2] + “y^2” [2,3]：各词平分自己的读法字。"""
+    words = [{"word": "x^2", "start": 0.0, "end": 1.0}, {"word": "+", "start": 1.0, "end": 2.0},
+             {"word": "y^2", "start": 2.0, "end": 3.0}]
+    assert _table(heard.chars_from_words(words)) == _even("x的平方") + [("加", 1.0, 2.0)] + _even("y的平方", 2.0, 3.0)
+
+
+def test_equation_word_then_lone_operator_and_operand():
+    """“a=b” [0,1] + “+” [1,1.5] + “c” [1.5,2]。"""
+    words = [{"word": "a=b", "start": 0.0, "end": 1.0}, {"word": "+", "start": 1.0, "end": 1.5},
+             {"word": "c", "start": 1.5, "end": 2.0}]
+    assert _table(heard.chars_from_words(words)) == _even("a等于b") + [("加", 1.0, 1.5), ("c", 1.5, 2.0)]
+
+
+def test_zero_length_operator_borrows_from_the_next_word_and_never_drops_the_power(no_audio):
+    """“x²” [0,1] + 零时长的 “+” [1,1] + “y” [1,2]：方不丢、x² 的时间段不变；“加”借 “y” 的时间段（加 y 平分 [1,2]）。"""
+    words = [{"word": "x²", "start": 0.0, "end": 1.0}, {"word": "+", "start": 1.0, "end": 1.0},
+             {"word": "y", "start": 1.0, "end": 2.0}]
+    assert _table(heard.chars_from_words(words)) == _even("x的平方") + _even("加y", 1.0, 2.0)
+    words.append({"word": "，结束。", "start": 2.0, "end": 2.6})
+    res = _run("$x^2${@m}加$y$，结束。", ["x²", "+", "y", "，结束。"], words=words)
+    assert res.how == {"m": "matched"} and res.marks["m"] == pytest.approx(1.0, abs=0.002)
+
+
+def test_trailing_zero_length_operator_borrows_from_the_previous_word():
+    """“x²” [0,1] + 零时长的 “+” [1,1]（后面没有词）：加并入前一段，时间单调，方不丢。"""
+    words = [{"word": "x²", "start": 0.0, "end": 1.0}, {"word": "+", "start": 1.0, "end": 1.0}]
+    assert _table(heard.chars_from_words(words)) == _even("x的平方加")

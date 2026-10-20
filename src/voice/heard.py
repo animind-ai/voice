@@ -8,9 +8,12 @@
 2. 数字：裸数字（如 “10”、“+3”）有两种读法（中文读法，或阿拉伯数字原样）。整句做一次格子上的对齐动态规划，
    同时决定每个数字用哪种读法，使整句与稿子的读法匹配最多；不是逐个贪心地定。
 3. 时间：表达式的每个读法字先归到一个听写词：和原字逐字相同的字母或数字（锚点，如 “x”）归它所在的词；
-   插入的读法字（的平方、等于、分之、负）归它们来源的原字（如 “²”、“=”）所在的词，来源跨几个词时按原字数的比例分。
+   插入的读法字（的平方、等于、分之、负）归它们来源的原字（如 “²”、“=”）所在的词：来源跨几个词时，在每个词的末尾试读
+   “单元开头到这个词为止”的原字，它正好是读法的开头时就在那里切开（“x²” “+” “y”：的平方归 “x²”，加归 “+”）；
+   切不开的（分数、百分数这类把后面的字提前读的写法）按原字数的比例分。
    每个词在表达式里的时间段平均分给归它的读法字：单独成词的字母（“x” + “²”）保留它自己的词的时间段，
    一个词里的整个式子（“a=b”）则逐字平分；连着几个没有锚点的词（如 “1” “/” “2”、“25” “%”）合成一段平分。
+   零时长的段（如零时长的 “+”）把自己的读法字并入相邻的有时长的段（优先后一段）；两边都没有时长才丢掉它自己的字。
    一个词跨几个单元时，词的时间段按每个内容字的展开字数比例分（所以 “看1/2好” 中的 “好” 从 5/6 秒开始）。
 
 表达式的边界（唯一的规则，expand 和 chars_from_words 共用）：相邻两个词里的字，只有两边都是字母或数字时才不连成一个表达式；
@@ -205,6 +208,15 @@ def _intervals(words: list[dict], chars, units, choice) -> list[tuple[float, flo
     return out
 
 
+def _prefix_len(chars, a: int, p: int, reading_chars: list[str]) -> int | None:
+    """单元里原字 a..p（到某个词的末尾）单独读出来的内容字数；它不是整个单元读法的开头（如分数、百分数会把后面的字提前）时返回 None。"""
+    try:
+        head = [ch for ch in normalize(f"${_latex(''.join(ch for ch, _ in chars[a:p]))}$") if textalign.is_content(ch)]
+    except Exception:
+        return None
+    return len(head) if head == reading_chars[:len(head)] else None
+
+
 def _emit(units, choice, chars, ivs) -> list[HeardChar]:
     """每个单元的读法字分给听写词（规则见模块说明第 3 条），每个词（或连着的没有锚点的几个词）的时间段平均分给它的读法字。"""
     out: list[HeardChar] = []
@@ -228,24 +240,54 @@ def _emit(units, choice, chars, ivs) -> list[HeardChar]:
             g0 = r
             while r < n and r not in anchor:
                 r += 1
-            # 这段插入的字来自前后两个锚点之间的原字；跨几个词时按原字数的比例分
-            src = [chars[i][1] for i in range(anchor[g0 - 1] + 1 if g0 > 0 else a, anchor[r] if r < n else b)]
-            src = src or [owner[g0 - 1] if g0 > 0 else owner[r]]
-            for k in range(r - g0):
-                owner[g0 + k] = src[int((k + 0.5) * len(src) / (r - g0))]
+            # 这段插入的字来自前后两个锚点之间的原字。跨几个词时，先在每个词的末尾切开：单元开头到这个词为止的原字单独读出来，
+            # 正好是读法的开头 L 个字，那前 L 个字就属于这个词及之前的词（“x²” “+” “y”：的平方归 “x²”，加归 “+”）。
+            # 切不开的部分（分数、百分数这类把后面的字提前读的写法）按原字数的比例分。
+            s_lo, s_hi = anchor[g0 - 1] + 1 if g0 > 0 else a, anchor[r] if r < n else b
+            cuts = [(g0, s_lo)]
+            for p in range(s_lo + 1, s_hi):
+                if chars[p][1] != chars[p - 1][1]:
+                    cut = _prefix_len(chars, a, p, reading_chars)
+                    if cut is not None and cuts[-1][0] <= cut <= r:
+                        cuts.append((cut, p))
+            cuts.append((r, s_hi))
+            for (r0, p0), (r1, p1) in zip(cuts, cuts[1:]):
+                src = [chars[i][1] for i in range(p0, p1)]
+                src = src or [owner[g0 - 1] if g0 > 0 else owner[r]]
+                for k in range(r1 - r0):
+                    owner[r0 + k] = src[int((k + 0.5) * len(src) / (r1 - r0))]
         anchored = {chars[i][1] for i in anchor.values()}
         chunk: dict[int, int] = {}  # 词 → 段：有锚点的词各自一段，连着的没有锚点的词合成一段
         for wi in dict.fromkeys(chars[i][1] for i in range(a, b)):
             prev = next(reversed(chunk), None)
             merge = prev is not None and prev not in anchored and wi not in anchored
             chunk[wi] = chunk[prev] if merge else len(set(chunk.values()))
-        for g in dict.fromkeys(chunk.values()):
+        groups = list(dict.fromkeys(chunk.values()))
+        spans = {}
+        for g in groups:
             span = [ivs[i] for i in range(a, b) if chunk[chars[i][1]] == g]
-            lo, hi = min(s for s, _ in span), max(e for _, e in span)
-            mine = [reading_chars[r] for r in range(n) if chunk[owner[r]] == g]
-            if hi > lo:  # 零时长的段借不到时间，不输出
-                out += [HeardChar(ch, lo + (hi - lo) * k / len(mine), lo + (hi - lo) * (k + 1) / len(mine))
-                        for k, ch in enumerate(mine)]
+            spans[g] = (min(s for s, _ in span), max(e for _, e in span))
+        mine = {g: [reading_chars[r] for r in range(n) if chunk[owner[r]] == g] for g in groups}
+        # 零时长的段（如零时长的 “+”）：它自己的读法字并入相邻的有时长的段（优先后一段，“加”在 “y” 前面），时间仍然单调；
+        # 两边都没有时长时只丢掉它自己的字。
+        for k, g in enumerate(groups):
+            lo, hi = spans[g]
+            if hi > lo or not mine[g]:
+                continue
+            near = [(groups[k + 1], True)] if k + 1 < len(groups) else []
+            near += [(groups[k - 1], False)] if k > 0 else []
+            for h, after in near:
+                h_lo, h_hi = spans[h]
+                if h_hi > h_lo:
+                    mine[h] = mine[g] + mine[h] if after else mine[h] + mine[g]
+                    spans[h] = (min(h_lo, lo), h_hi) if after else (h_lo, max(h_hi, hi))
+                    break
+            mine[g] = []
+        for g in groups:
+            lo, hi = spans[g]
+            if hi > lo and mine[g]:
+                out += [HeardChar(ch, lo + (hi - lo) * k / len(mine[g]), lo + (hi - lo) * (k + 1) / len(mine[g]))
+                        for k, ch in enumerate(mine[g])]
     return out
 
 
