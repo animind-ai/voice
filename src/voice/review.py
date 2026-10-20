@@ -1,16 +1,20 @@
 """成片审片：把视频（加场景稿 / 旁白 / 书签时刻）交给 Gemini，写出结构化报告。
 
-报告 JSON 的 `gate` 和 scene-spec 检查器的 `Report.to_dict()` 同形（ok / issues / stats），
-方便以后当作流水线的门。模型调用可以换成假的，测试不联网。
+报告里的 `gate` 和 scene-spec 检查器的 `Report.to_dict()` 同形（ok / issues / stats），
+方便以后当作流水线的门。它不是 `check_timing` 的输入：`check_timing` 要的是 `{beats: ...}`
+（旁白和书签时刻），不要把 `gate` 或整份审片 JSON 交进去。模型调用可以换成假的，测试不联网。
 
 费用表跟 synth.py 一样写在这里。价格变了就改 PRICE，并改 README 的「费用」。
 """
 
 from __future__ import annotations
 
+import difflib
 import json
+import math
 import os
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -23,6 +27,8 @@ DEFAULT_MAX_CHUNK_SECONDS = 300.0
 DEFAULT_OVERLAP_SECONDS = 8.0
 MAX_ISSUES_PER_CHUNK = 40
 INLINE_MAX_BYTES = 15 * 1024 * 1024
+# 跨段去重：证据文本的相似度达到这个比例，才当成同一条问题。同一段里的问题一律保留。
+EVIDENCE_SIMILARITY = 0.68
 
 # 标准档，美元 / 百万 token。https://ai.google.dev/gemini-api/docs/pricing （2026-10-20 查阅）。
 # until 是涨价生效日，当天起用 *_after。long_at 是长上下文分界（prompt token 超过它用 *_long）。
@@ -106,7 +112,7 @@ class Chunk:
 
 @dataclass
 class Turn:
-    """一次审片请求。calls 里每一对 (input, output) 是一次实际的模型 HTTP 调用（含重试）。"""
+    """一次审片请求。calls 的每一项是 (input, output) 或 (input, output, token_source)，含重试。"""
 
     text: str
     calls: list[tuple[int, int]] = field(default_factory=lambda: [(0, 0)])
@@ -263,16 +269,17 @@ def load_thresholds(path: Path | None) -> dict:
     if unknown:
         raise ReviewError(f"阈值文件有不认识的字段：{sorted(unknown)}")
     if "fail_severities" in data:
-        bad = [item for item in data["fail_severities"] if item not in SEVERITY_RANK]
-        if not isinstance(data["fail_severities"], list) or bad:
+        values = data["fail_severities"]
+        if not isinstance(values, list) or any(not isinstance(item, str) or item not in SEVERITY_RANK for item in values):
             raise ReviewError(f"fail_severities 只能是 {list(SEVERITIES)}")
-        thresholds["fail_severities"] = list(data["fail_severities"])
+        thresholds["fail_severities"] = list(values)
     if "max_counts" in data:
         counts = data["max_counts"]
         if not isinstance(counts, dict):
             raise ReviewError("max_counts 必须是对象")
         for key, value in counts.items():
-            if key not in SEVERITY_RANK or isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if (not isinstance(key, str) or key not in SEVERITY_RANK or isinstance(value, bool)
+                    or not isinstance(value, int) or value < 0):
                 raise ReviewError(f"max_counts.{key} 必须是非负整数，级别只能是 {list(SEVERITIES)}")
         thresholds["max_counts"] = dict(counts)
     if "fail_categories" in data:
@@ -280,7 +287,7 @@ def load_thresholds(path: Path | None) -> dict:
         if not isinstance(cats, dict):
             raise ReviewError("fail_categories 必须是对象")
         for key, value in cats.items():
-            if key not in CATEGORY_CODE or value not in SEVERITY_RANK:
+            if not isinstance(key, str) or not isinstance(value, str) or key not in CATEGORY_CODE or value not in SEVERITY_RANK:
                 raise ReviewError(f"fail_categories.{key}={value!r} 不合法")
         thresholds["fail_categories"] = dict(cats)
     return thresholds
@@ -289,15 +296,27 @@ def load_thresholds(path: Path | None) -> dict:
 def _as_float(value, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReviewSchemaError(f"{name} 必须是数字")
-    if value < 0:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ReviewSchemaError(f"{name} 必须是有限数字")
+    if number < 0:
         raise ReviewSchemaError(f"{name} 不能为负")
-    return float(value)
+    return number
 
 
 def _as_text(value, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ReviewSchemaError(f"{name} 必须是非空字符串")
     return value.strip()[:800]
+
+
+def _reject_nonstandard_number(token: str):
+    """Python 的 json 默认接受 NaN / Infinity。这些不是 JSON，时间戳里会出现就会弄垮报告。"""
+    raise json.JSONDecodeError(f"不允许非标准数字 {token}", token, 0)
+
+
+def _loads(body: str):
+    return json.loads(body, parse_constant=_reject_nonstandard_number)
 
 
 def extract_json(text: str) -> dict:
@@ -309,13 +328,13 @@ def extract_json(text: str) -> dict:
             lines = lines[:-1]
         body = "\n".join(lines).strip()
     try:
-        data = json.loads(body)
+        data = _loads(body)
     except json.JSONDecodeError:
         start, end = body.find("{"), body.rfind("}")
         if start < 0 or end <= start:
             raise ReviewSchemaError("输出不是 JSON 对象") from None
         try:
-            data = json.loads(body[start:end + 1])
+            data = _loads(body[start:end + 1])
         except json.JSONDecodeError as exc:
             raise ReviewSchemaError(f"输出不是 JSON：{exc}") from exc
     if not isinstance(data, dict):
@@ -339,9 +358,9 @@ def parse_model_output(text: str, *, chunk_len: float) -> dict:
             raise ReviewSchemaError(f"issues[{index}] 必须是对象")
         category = raw.get("category")
         severity = raw.get("severity")
-        if category not in CATEGORY_CODE:
+        if not isinstance(category, str) or category not in CATEGORY_CODE:
             raise ReviewSchemaError(f"issues[{index}].category={category!r} 不在 {list(CATEGORIES)}")
-        if severity not in SEVERITY_RANK:
+        if not isinstance(severity, str) or severity not in SEVERITY_RANK:
             raise ReviewSchemaError(f"issues[{index}].severity={severity!r} 不在 {list(SEVERITIES)}")
         start = _as_float(raw.get("start"), f"issues[{index}].start")
         end = _as_float(raw.get("end"), f"issues[{index}].end")
@@ -378,13 +397,26 @@ def _overlap_fraction(a: dict, b: dict) -> float:
     return overlap / shorter
 
 
+def _evidence_similar(left: str, right: str) -> bool:
+    a = "".join(left.split())
+    b = "".join(right.split())
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= EVIDENCE_SIMILARITY
+
+
 def dedupe_issues(issues: list[dict]) -> list[dict]:
-    """重叠窗口里同一类、时间重叠过半的问题合并成一条，留下更严重的那条证据。"""
+    """只合并相邻窗口里、时间和证据都对得上的同一条。同一段里的问题全部留下。"""
     ordered = sorted(issues, key=lambda item: (item["start"], -SEVERITY_RANK[item["severity"]]))
     kept: list[dict] = []
     for issue in ordered:
         match = next((prev for prev in kept
-                      if prev["category"] == issue["category"] and _overlap_fraction(prev, issue) >= 0.5), None)
+                      if prev.get("chunk") != issue.get("chunk")
+                      and prev["category"] == issue["category"]
+                      and _overlap_fraction(prev, issue) >= 0.5
+                      and _evidence_similar(prev["evidence"], issue["evidence"])), None)
         if match is None:
             kept.append(dict(issue))
             continue
@@ -566,21 +598,27 @@ def total_usage(path: Path) -> tuple[int, float]:
     return len(rows), sum(row.get("est_usd", 0.0) for row in rows)
 
 
+def _call_parts(record: tuple) -> tuple[int, int, str | None]:
+    source = record[2] if len(record) > 2 else None
+    return record[0], record[1], source
+
+
 def _append_usage(path: Path, episode: str, chunk: Chunk, model: str, turn: Turn, prompt_version: str,
-                  today: date) -> float:
+                  today: date, run_id: str) -> float:
     path.parent.mkdir(parents=True, exist_ok=True)
     spent = 0.0
     stamp = datetime.now().isoformat(timespec="seconds")
     with path.open("a", encoding="utf-8") as handle:
-        for attempt, (input_tokens, output_tokens) in enumerate(turn.calls, start=1):
+        for attempt, record in enumerate(turn.calls, start=1):
+            input_tokens, output_tokens, source = _call_parts(record)
             usd, known = price_call(model, input_tokens, output_tokens, today)
-            record = {
-                "time": stamp, "episode": episode, "chunk": chunk.index, "attempt": attempt,
+            row = {
+                "time": stamp, "run_id": run_id, "episode": episode, "chunk": chunk.index, "attempt": attempt,
                 "model": model, "prompt_version": prompt_version, "input_tokens": input_tokens,
-                "output_tokens": output_tokens, "est_usd": round(usd, 6), "token_source": turn.token_source,
-                "price_known": known,
+                "output_tokens": output_tokens, "est_usd": round(usd, 6),
+                "token_source": source or turn.token_source, "price_known": known,
             }
-            handle.write(json.dumps(_redact_obj(record), ensure_ascii=False) + "\n")
+            handle.write(json.dumps(_redact_obj(row), ensure_ascii=False) + "\n")
             spent += usd
     return spent
 
@@ -632,9 +670,14 @@ def review_episode(
     chunks = plan_chunks(duration, max_chunk_seconds, overlap_seconds)
     schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
     log_path = out_json.parent / "review_usage.jsonl"
+    run_id = uuid.uuid4().hex
     summaries: list[str] = []
     found: list[dict] = []
     chunk_meta: list[dict] = []
+    run_calls = 0
+    run_input = 0
+    run_output = 0
+    run_usd = 0.0
 
     import tempfile
 
@@ -654,14 +697,19 @@ def review_episode(
                     turn = reviewer(video=clip, system=system, user=user, chunk=chunk)
                 except ReviewError as exc:
                     if exc.calls:
-                        _append_usage(log_path, video.name, chunk, model,
-                                      Turn(text="", calls=list(exc.calls), token_source=exc.token_source),
-                                      prompt_version, today)
+                        failed = Turn(text="", calls=list(exc.calls), token_source=exc.token_source)
+                        run_usd += _append_usage(log_path, video.name, chunk, model, failed, prompt_version, today, run_id)
+                        run_calls += failed.attempts
+                        run_input += failed.input_tokens
+                        run_output += failed.output_tokens
                     raise
                 if not isinstance(turn, Turn) or not turn.calls:
                     raise ReviewError("reviewer 必须返回带用量的 Turn")
                 chunk_calls += turn.attempts
-                _append_usage(log_path, video.name, chunk, model, turn, prompt_version, today)
+                run_usd += _append_usage(log_path, video.name, chunk, model, turn, prompt_version, today, run_id)
+                run_calls += turn.attempts
+                run_input += turn.input_tokens
+                run_output += turn.output_tokens
                 try:
                     parsed = parse_model_output(turn.text, chunk_len=chunk.length)
                     break
@@ -686,9 +734,8 @@ def review_episode(
     passed, violations = decide(merged, thresholds)
     gate = project_gate(merged, thresholds, violations)
     counts = {name: sum(1 for issue in merged if issue["severity"] == name) for name in SEVERITIES}
-    new_lines = sum(item["calls"] for item in chunk_meta)
-    calls, est_usd = _sum_new_lines(log_path, new_lines)
-    input_tokens, output_tokens = _sum_tokens(log_path, new_lines)
+    calls, est_usd = run_calls, run_usd
+    input_tokens, output_tokens = run_input, run_output
     if summaries:
         summary = summaries[0] if len(summaries) == 1 else "\n".join(dict.fromkeys(summaries))
     else:
@@ -732,7 +779,7 @@ def review_episode(
 
 
 def validate_report(report: dict) -> None:
-    """写出前核对报告形状，保证 scene-spec 以后能直接读 gate。"""
+    """写出前核对报告形状。gate 对齐 Report.to_dict()，不是 check_timing 的 {beats: ...}。"""
     required = ("schema", "prompt_version", "episode", "model", "duration_s", "passed", "ok", "summary",
                 "thresholds", "counts", "issues", "gate", "usage", "chunks")
     missing = [key for key in required if key not in report]
@@ -758,18 +805,6 @@ def validate_report(report: dict) -> None:
             raise ReviewError("gate level 不合法")
     if set(report["usage"]) != {"calls", "input_tokens", "output_tokens", "est_usd", "log"}:
         raise ReviewError("usage 字段不完整")
-
-
-def _sum_new_lines(path: Path, new_lines: int) -> tuple[int, float]:
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    fresh = rows[-new_lines:] if new_lines else []
-    return len(fresh), sum(row.get("est_usd", 0.0) for row in fresh)
-
-
-def _sum_tokens(path: Path, new_lines: int) -> tuple[int, int]:
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    fresh = rows[-new_lines:] if new_lines else []
-    return (sum(row.get("input_tokens", 0) for row in fresh), sum(row.get("output_tokens", 0) for row in fresh))
 
 
 def default_reviewer(model: str, *, resolution: str = "high", processing: str = "static", attempts: int = 3, sleep=None):

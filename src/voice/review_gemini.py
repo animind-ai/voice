@@ -136,18 +136,35 @@ def _file_part(types, uri: str, mime: str, resolution: dict, processing: str):
         return types.Part.from_uri(file_uri=uri, mime_type=mime, media_resolution=resolution)
 
 
+class PartialStreamError(Exception):
+    """流在结束前断了。usage 是断点之前拿到的用量，没有就是 None。"""
+
+    def __init__(self, exc: BaseException, usage):
+        super().__init__(str(exc))
+        self.usage = usage
+        self.code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+
+
 def generate_text(client, model: str, contents, config) -> tuple[str, object]:
-    """优先用流式，避免长视频把同步请求拖过认证窗口。返回 (文本, usage)。"""
+    """优先用流式，避免长视频把同步请求拖过认证窗口。返回 (文本, usage)。中途失败时带上已收到的用量。"""
     chunks: list[str] = []
     usage = None
-    for piece in client.models.generate_content_stream(model=model, contents=contents, config=config):
-        text = getattr(piece, "text", None)
-        if text:
-            chunks.append(text)
-        meta = getattr(piece, "usage_metadata", None)
-        if meta is not None:
-            usage = meta
+    try:
+        for piece in client.models.generate_content_stream(model=model, contents=contents, config=config):
+            text = getattr(piece, "text", None)
+            if text:
+                chunks.append(text)
+            meta = getattr(piece, "usage_metadata", None)
+            if meta is not None:
+                usage = meta
+    except Exception as exc:
+        raise PartialStreamError(exc, usage) from exc
     return "".join(chunks), usage
+
+
+def _record_call(calls: list, input_tokens: int, output_tokens: int, source: str) -> str:
+    calls.append((input_tokens, output_tokens, source))
+    return source
 
 
 class GeminiReviewer:
@@ -170,12 +187,12 @@ class GeminiReviewer:
         except ImportError as exc:
             raise ReviewError("审片需要 google-genai：uv sync --extra review") from exc
         client = None
-        uploaded_name = None
-        calls: list[tuple[int, int]] = []
+        self._uploaded_name = None
+        calls: list[tuple] = []
         source = "usage"
         try:
             client = self.client or make_client()
-            part, uploaded_name = self._video_part(client, types, video)
+            part = self._video_part(client, types, video)
             config = types.GenerateContentConfig(
                 system_instruction=system,
                 response_mime_type="application/json",
@@ -186,14 +203,23 @@ class GeminiReviewer:
                 nonlocal source
                 try:
                     text, usage = generate_text(client, self.model, [part, user], config)
-                except Exception:
-                    calls.append((0, 0))
+                except Exception as exc:
+                    partial = getattr(exc, "usage", None)
+                    input_tokens, output_tokens = tokens_from_usage(partial)
+                    if partial is not None and (input_tokens or output_tokens):
+                        source = _record_call(calls, input_tokens, output_tokens, "usage")
+                    else:
+                        input_tokens, output_tokens = estimate_tokens(system + user, chunk.length, self.resolution)
+                        source = _record_call(calls, input_tokens, output_tokens, "estimate")
                     raise
                 input_tokens, output_tokens = tokens_from_usage(usage)
                 if input_tokens == 0 and output_tokens == 0:
                     input_tokens, output_tokens = estimate_tokens(system + user, chunk.length, self.resolution)
-                    source = "estimate"
-                calls.append((input_tokens, output_tokens))
+                    source = _record_call(calls, input_tokens, output_tokens, "estimate")
+                else:
+                    call_source = _record_call(calls, input_tokens, output_tokens, "usage")
+                    if source != "estimate":
+                        source = call_source
                 return text
 
             try:
@@ -205,7 +231,8 @@ class GeminiReviewer:
             return Turn(text=text, calls=calls, token_source=source)
         finally:
             if client is not None:
-                self._delete(client, uploaded_name)
+                self._delete(client, self._uploaded_name)
+                self._uploaded_name = None
 
     def _delete(self, client, name: str | None) -> None:
         if not name:
@@ -221,17 +248,23 @@ class GeminiReviewer:
         mime = "video/mp4"
         if video.stat().st_size <= INLINE_MAX_BYTES:
             data = video.read_bytes()
-            return _inline_part(types, data, mime, resolution, processing), None
+            return _inline_part(types, data, mime, resolution, processing)
         try:
             uploaded = client.files.upload(file=str(video))
         except Exception as exc:
             raise ReviewError(redact(
                 "这段超过 15MB，Files API 上传失败。设置 GEMINI_API_KEY 走开发者 API，或减小 --max-chunk-seconds。"
                 f"（{exc}）")) from exc
-        uploaded = wait_until_active(client, uploaded, sleep=self.sleep)
-        name = getattr(uploaded, "name", None)
+        # 轮询失败也要删掉已经传上去的文件，所以名字立刻记下来。
+        self._uploaded_name = getattr(uploaded, "name", None)
+        try:
+            uploaded = wait_until_active(client, uploaded, sleep=self.sleep)
+        except ReviewError as exc:
+            raise ReviewError(redact(str(exc))) from exc
+        except Exception as exc:
+            raise ReviewError(redact(f"等待视频处理失败：{exc}")) from exc
         uri = getattr(uploaded, "uri", None)
         if not uri:
             raise ReviewError("Files API 没有返回视频地址。可以改用 GEMINI_API_KEY，或减小 --max-chunk-seconds 让每段小于 15MB。")
         mime = getattr(uploaded, "mime_type", None) or mime
-        return _file_part(types, uri, mime, resolution, processing), name
+        return _file_part(types, uri, mime, resolution, processing)

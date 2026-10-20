@@ -135,7 +135,6 @@ def review_command(args) -> int:
         reviewer = review.default_reviewer(
             model, resolution=args.media_resolution, processing=args.media_processing, attempts=args.attempts)
         log_path = out_json.parent / "review_usage.jsonl"
-        before = review.total_usage(log_path)
         report = review.review_episode(
             args.video, reviewer=reviewer, out_json=out_json, model=model, spec=args.spec, audio=args.audio,
             lang=args.lang, thresholds=thresholds, max_chunk_seconds=args.max_chunk_seconds,
@@ -151,7 +150,8 @@ def review_command(args) -> int:
     after = review.total_usage(out_json.parent / "review_usage.jsonl")
     status = "通过" if report["passed"] else "未通过"
     print(f"{args.video.name}: {status}（{report['usage']['calls']} 次模型调用，约 ${report['usage']['est_usd']:.4f}）")
-    print(f"这次调用 {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
+    usage = report["usage"]
+    print(f"这次调用 {usage['calls']} 次，约 ${usage['est_usd']:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
     print(out_json.with_suffix(".md").read_text(encoding="utf-8"))
     return 0 if report["passed"] else 1
 

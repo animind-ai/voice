@@ -61,7 +61,7 @@ kit 读到 `marks` 就用真实时刻，没有就按字符位置比例估算。
 
 短于 `--max-chunk-seconds`（默认 300 秒）的片子一次看完，不重新编码。更长的片子用 ffmpeg 切成重叠窗口（默认重叠 8 秒），每段单独看，时间戳加回整集，重叠处同一类问题会合并。单段不超过 15MB 时内联上传，更大就走 Files API。数学画面默认 `--media-resolution high`，方便读公式。`--media-processing` 默认 `static`（大约每秒一帧，布局问题不容易漏）；`agentic` 更省 token，模型会自己挑片段看，可能放过重叠和出框。
 
-每次 HTTP 调用追加一行到报告旁边的 `review_usage.jsonl`（和 `tts_usage.jsonl` 一样可累计）。API 返回了 token 数就按那个算钱；没返回就按文字加视频时长粗估，并在记录里标 `token_source: estimate`。价目是标准档，写在 `src/voice/review.py` 的 `PRICES`（2026-10-20 对照 [Gemini 定价](https://ai.google.dev/gemini-api/docs/pricing)）：
+每次 HTTP 调用追加一行到报告旁边的 `review_usage.jsonl`（和 `tts_usage.jsonl` 一样可累计）。这一次报告里的费用只累加这次内存里的调用，日志每行带 `run_id`，不会去读共享日志的最后几行，所以几集同时审不会把别人的费用算进来。API 返回了 token 数就按那个算钱；流在中途断了就保留已经收到的用量。一个 token 都没拿到（或拿到的是 0）就按文字加视频时长粗估，并在记录里标 `token_source: estimate`，不会记成已经确认的 0。价目是标准档，写在 `src/voice/review.py` 的 `PRICES`（2026-10-20 对照 [Gemini 定价](https://ai.google.dev/gemini-api/docs/pricing)）：
 
 | 模型 | 输入 / 输出（美元 / 百万 token） | 何时涨价 |
 | --- | --- | --- |
@@ -81,7 +81,7 @@ kit 读到 `marks` 就用真实时刻，没有就按字符位置比例估算。
 
 `fail_categories` 表示这类问题从哪个级别起算失败（上面是：数学问题只要 minor 也失败）。`max_counts` 是某一级条数的上限，超过会多一条 `RV001`。
 
-JSON 里给流水线看的是 `gate`，形状和 scene-spec 检查器的 `Report.to_dict()` 一样：`ok`、`issues`（`level` / `code` / `path` / `message`）、`stats`。`level` 为 `error` 的条目才让 `ok` 变成 false；`path` 是整集时间轴上的 `t=<start>-<end>`。稳定代码：
+JSON 里给流水线看的是 `gate`，形状和 scene-spec 检查器的 `Report.to_dict()` 一样：`ok`、`issues`（`level` / `code` / `path` / `message`）、`stats`。`level` 为 `error` 的条目才让 `ok` 变成 false；`path` 是整集时间轴上的 `t=<start>-<end>`。`gate` 不是 scene-spec `check_timing` 的输入。`check_timing` 要的是 `{beats: ...}`（旁白和书签时刻），不要把 `gate` 或整份审片 JSON 交进去。稳定代码：
 
 | 代码 | category | 在看什么 |
 | --- | --- | --- |

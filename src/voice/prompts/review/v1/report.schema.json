@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://animind.ai/schemas/review-report-v1.json",
   "title": "animind episode review report v1",
-  "description": "Written by animind-voice review. scene-spec (or a later pipeline gate) should read `gate`, which has the same shape as scene_spec.report.Report.to_dict(): ok, issues[{level, code, path, message}], stats. ok is false when the episode fails the configured thresholds. level is error for a failing item and warning otherwise. path is t=<start>-<end> in seconds on the full episode timeline.",
+  "description": "Written by animind-voice review. scene-spec (or a later pipeline gate) should read `gate`, which has the same shape as scene_spec.report.Report.to_dict(): ok, issues[{level, code, path, message}], stats. ok is false when the episode fails the configured thresholds. level is error for a failing item and warning otherwise. path is t=<start>-<end> in seconds on the full episode timeline. `gate` is not the input to scene-spec check_timing, which expects {beats: ...} (narration and bookmark times). Do not pass `gate` or this report into check_timing.",
   "type": "object",
   "additionalProperties": false,
   "required": [
