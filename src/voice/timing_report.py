@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 from .script import Beat
+from .ttscache import write_text_atomic
 
 REPORT_NAME = "timing-report.json"
 
@@ -28,5 +29,5 @@ def build(beats: list[Beat], audio_dir: Path) -> dict:
 
 def write(beats: list[Beat], audio_dir: Path) -> Path:
     path = audio_dir / REPORT_NAME
-    path.write_text(json.dumps(build(beats, audio_dir), ensure_ascii=False, indent=1), encoding="utf-8")
+    write_text_atomic(path, json.dumps(build(beats, audio_dir), ensure_ascii=False, indent=1))
     return path

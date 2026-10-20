@@ -8,6 +8,7 @@ authors = [{ name = "Boxi Yu" }]
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "numpy>=1.26",
+  "PyYAML>=6.0",  # trace.py 用 yaml.compose 取场景文件的行号
   "scene-spec",
   "zh-math-reading",
 ]

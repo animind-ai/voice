@@ -1,0 +1,10 @@
+{"id": "trace-demo", "title": "追溯演示", "video": "episode.mp4", "duration": 15.8, "segmented": false,
+ "chapters": [
+  {"id": "Hook", "title": "Hook", "start": 0.0, "end": 4.5, "shows": [], "segment_end": false, "steps": []},
+  {"id": "Think", "title": "Think", "start": 4.5, "end": 9.3, "shows": [], "segment_end": false, "steps": [],
+   "pause": {"type": "think", "prompt": null, "time": 6.3, "hold": 3.0}},
+  {"id": "Show", "title": "只有画面", "start": 9.3, "end": 11.0, "shows": [], "segment_end": false, "steps": []},
+  {"id": "Solve", "title": "Solve", "start": 11.0, "end": 15.8, "shows": [], "segment_end": false,
+   "steps": [{"time": 12.0, "hold": 0.5, "resume": 12.5, "at": "0@x"}]}
+ ],
+ "stops": []}

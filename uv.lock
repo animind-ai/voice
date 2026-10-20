@@ -13,6 +13,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pyyaml" },
     { name = "scene-spec" },
     { name = "zh-math-reading" },
 ]
@@ -43,6 +44,7 @@ requires-dist = [
     { name = "google-genai", marker = "extra == 'vertex'", specifier = ">=1.0" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'align'", specifier = ">=0.4" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "scene-spec", editable = "../scene-spec" },
     { name = "zh-math-reading", editable = "../zh-math-reading" },
 ]

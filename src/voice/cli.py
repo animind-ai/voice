@@ -1,16 +1,19 @@
 """命令行：
 
     animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0] [--allow-env-voice] [--lang en]
+                        [--only BEAT ...] [--force] [--no-cache] [--no-wait]
     animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型] [--lang en]
     animind-voice pitch SPEC --audio 音频目录 [--fix --env 密钥文件] [--lang en]
-    animind-voice review EPISODE.mp4 [--spec SPEC] [--audio 音频目录] [--env 密钥文件] [--model M] [--out 报告.json]
+    animind-voice review EPISODE.mp4 [--spec SPEC] [--audio 音频目录] [--chapters EPISODE.chapters.json] [--env 密钥文件] [--model M] [--out 报告.json]
 
 synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json，
+每句的原声缓存在 <音频目录>/.cache/（只改一句只重念这一句，日志 "Hook: 2 cached, 1 synthesized"；--no-cache 全部重念），
 写出 manifest.json（实际用的 model / voice / speed）和 timing-report.json（给 scene-spec check --timing 用）。
 声音以场景的 style.voice 为准；--model/--voice/--speed 显式覆盖；GEMINI_TTS_* 环境变量只有 --allow-env-voice 或 VOICE_ALLOW_ENV_OVERRIDE=1 才采用；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
 review 把成片（可带场景稿和 timing）交给 Gemini 看画面和声音，写出 JSON 报告和一份短 Markdown。退出码：0 通过，1 未通过，2 用法或调用失败。
+synth / align / pitch --fix 整个运行独占音频目录（.cache/synth.lock）：另一个在跑就等（打一行 waiting for another synth on …），--no-wait 则直接退出 2。
 --lang en 念英文版（每句的 en，书签写在 en 里；见 scene_spec.localize）。synth / align / pitch 要用同一个 --lang 和音频目录；review 用它读场景稿。
 """
 
@@ -41,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--allow-env-voice", action="store_true",
                    help="允许 GEMINI_TTS_MODEL / GEMINI_TTS_VOICE 覆盖场景的声音（会大声警告）；也可设 VOICE_ALLOW_ENV_OVERRIDE=1")
     s.add_argument("--only", nargs="*", default=[], help="只处理这些 beat")
+    s.add_argument("--force", action="store_true",
+                   help="句子和停顿都没变也重拼 <beat>.wav、重写 timing.json；没改的句子仍读缓存，不重新调用 TTS")
+    s.add_argument("--no-cache", action="store_true", help="不读句子缓存：每句都重新调用 TTS，并刷新缓存（隐含 --force）")
     a = sub.add_parser("align", help="Whisper 对齐书签 + 回听检查")
     a.add_argument("spec", type=Path)
     a.add_argument("--audio", type=Path, required=True)
@@ -55,10 +61,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", nargs="*", default=[])
     for cmd in (s, a, p):
         cmd.add_argument("--lang", choices=["zh", "en"], default="zh", help="念哪种语言的版本，默认中文")
+        cmd.add_argument("--no-wait", action="store_true",
+                         help="音频目录正被另一个 synth / align / pitch --fix 使用时不等，直接报错退出（默认等它跑完）")
     r = sub.add_parser("review", help="用 Gemini 看整集成片，写出审片报告")
     r.add_argument("video", type=Path, help="成片，通常是 mp4")
     r.add_argument("--spec", type=Path, help="这一集的 scene-spec；有的话会把旁白和书签附给模型")
     r.add_argument("--audio", type=Path, help="synth/align 的输出目录，读取 <beat>.timing.json")
+    r.add_argument("--chapters", type=Path,
+                   help="kit 写的 <成片>.chapters.json（默认取视频旁边的同名文件）；有 --spec 时用它把问题对到场景文件的行")
     r.add_argument("--env", type=Path, help="含 GEMINI_API_KEY 或 GOOGLE_* 的文件；不会打印其内容")
     r.add_argument("--model", help="默认 GEMINI_REVIEW_MODEL，否则 gemini-4-argon")
     r.add_argument("--out", type=Path, help="报告 JSON 的路径，或一个目录；默认写在视频旁边")
@@ -84,65 +94,97 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     beats = [b for b in all_beats if not args.only or b.id in args.only]
 
-    if args.command == "pitch":
-        return pitch_command(doc, beats, args)
+    from .ttscache import Busy
 
-    if args.command == "synth":
-        from . import synth
+    try:
+        if args.command == "pitch":
+            return pitch_command(doc, beats, args)
+        if args.command == "synth":
+            return synth_command(doc, all_beats, beats, args)
+        return align_command(doc, beats, args)
+    except Busy as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
 
-        warned = 0
-        for beat in beats:
-            for sentence in beat.sentences:
-                for w in sentence.warnings():
-                    warned += 1
-                    print(f"  ⚠ {beat.id}[{sentence.key}] {w}")
-        if warned:
-            print(f"读法检查：{warned} 条提示（只提示，不拦截合成；改 say 文本后会重新合成这一句）")
 
-        synth.load_env(args.env)
-        try:
-            choice = policy.resolve(doc, model=args.model, voice=args.voice, speed=args.speed,
-                                    allow_env=policy.env_override_allowed(os.environ, args.allow_env_voice))
-        except ValueError as exc:
-            print(f"{args.spec}: {exc}", file=sys.stderr)
-            return 2
-        for line in choice.notices:
-            print(f"提示：{line}", file=sys.stderr)
-        for line in choice.warnings:
-            print(line, file=sys.stderr)
-        if not choice.policy_ok:
-            print(f"WARNING: 这批音频不符合发布政策（{'；'.join(choice.policy_problems())}）。"
-                  f"发布要求 {REQUIRED_MODEL}、{REQUIRED_VOICE}、语速 {REQUIRED_SPEED:g}；这批输出不可发布。", file=sys.stderr)
-        # speak 函数从 GEMINI_TTS_VOICE 读声音（OpenRouter 的 body / Vertex 的 voice_name），这里填入实际用的那个
-        os.environ["GEMINI_TTS_VOICE"] = choice.voice
-        args.out.mkdir(parents=True, exist_ok=True)
-        log_path = args.out / "tts_usage.jsonl"
+def _locked(audio_dir: Path, args):
+    """这个音频目录的独占锁（ttscache.dir_lock）。写音频目录的命令整个运行都持有它；只读的 review 不用。"""
+    from .ttscache import dir_lock
+
+    return dir_lock(audio_dir, wait=not args.no_wait, log=lambda line: print(line, file=sys.stderr))
+
+
+def synth_command(doc: dict, all_beats: list, beats: list, args) -> int:
+    from . import synth
+
+    warned = 0
+    for beat in beats:
+        for sentence in beat.sentences:
+            for w in sentence.warnings():
+                warned += 1
+                print(f"  ⚠ {beat.id}[{sentence.key}] {w}")
+    if warned:
+        print(f"读法检查：{warned} 条提示（只提示，不拦截合成；改 say 文本后会重新合成这一句）")
+
+    synth.load_env(args.env)
+    try:
+        choice = policy.resolve(doc, model=args.model, voice=args.voice, speed=args.speed,
+                                allow_env=policy.env_override_allowed(os.environ, args.allow_env_voice))
+    except ValueError as exc:
+        print(f"{args.spec}: {exc}", file=sys.stderr)
+        return 2
+    for line in choice.notices:
+        print(f"提示：{line}", file=sys.stderr)
+    for line in choice.warnings:
+        print(line, file=sys.stderr)
+    if not choice.policy_ok:
+        print(f"WARNING: 这批音频不符合发布政策（{'；'.join(choice.policy_problems())}）。"
+              f"发布要求 {REQUIRED_MODEL}、{REQUIRED_VOICE}、语速 {REQUIRED_SPEED:g}；这批输出不可发布。", file=sys.stderr)
+    # speak 函数从 GEMINI_TTS_VOICE 读声音（OpenRouter 的 body / Vertex 的 voice_name），这里填入实际用的那个
+    os.environ["GEMINI_TTS_VOICE"] = choice.voice
+    args.out.mkdir(parents=True, exist_ok=True)
+    log_path = args.out / "tts_usage.jsonl"
+    persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
+    # 整个运行独占音频目录：句子缓存、wav / timing / 说明、manifest、时间报告都只有这一个 synth 在写
+    with _locked(args.out, args):
+        for line in policy.reconcile(args.out):  # 上次在发布途中被打断：按说明把 manifest 修好（见 policy.py）
+            print(f"manifest 按发布说明修正：{line}", file=sys.stderr)
         before = synth.total_cost(log_path)
-        persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
         for beat in beats:
-            synth.synth_beat(beat, args.out, persona, choice.model, choice.voice, choice.speed, speak=synth.default_speak)
+            # 换 wav 之前先在 manifest 里把这一段记成 pending（不合规），发布完再提交实际来源
+            synth.synth_beat(beat, args.out, persona, choice.model, choice.voice, choice.speed,
+                             speak=synth.default_speak, no_cache=args.no_cache, reassemble=args.force,
+                             before_publish=lambda b=beat.id: policy.mark_pending(args.out, b, args.lang, choice.sources))
+            if (args.out / f"{beat.id}.timing.json").exists():
+                policy.write_manifest(args.out, choice, args.lang, [beat.id])
         after = synth.total_cost(log_path)
         done = [b.id for b in beats if (args.out / f"{b.id}.timing.json").exists()]
-        for conflict in policy.write_manifest(args.out, choice, args.lang, done):
-            print(f"WARNING: {args.out}：{conflict}", file=sys.stderr)
+        conflicts = policy.write_manifest(args.out, choice, args.lang, done)  # 提醒按最终状态给
         report = timing_report.write(all_beats, args.out)
-        print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
-        print(f"模型 {choice.model}，声音 {choice.voice}，语速 {choice.speed:g}；时间报告 {report}")
-        return 0
+    for conflict in conflicts:
+        print(f"WARNING: {args.out}：{conflict}", file=sys.stderr)
+    print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
+    print(f"模型 {choice.model}，声音 {choice.voice}，语速 {choice.speed:g}；时间报告 {report}")
+    return 0
 
-    from . import align
 
+def align_command(doc: dict, beats: list, args) -> int:
+    from . import align, trace
+
+    if not args.audio.is_dir():
+        print(f"找不到音频目录 {args.audio}，先运行 synth", file=sys.stderr)
+        return 2
     backend = args.backend or align.default_backend()
     model = args.model or align.DEFAULT_MODELS[backend]
     print(f"对齐后端 {backend}，模型 {model}")
+    refs = trace.scene_refs(doc, args.spec, args.lang)
     flagged = 0
-    for beat in beats:
-        results = align.align_beat(beat, args.audio, model, align.TRANSCRIBERS[backend])
-        for r in results:
-            if r.flagged:
-                flagged += 1
-                sure = f"；复核仍缺 {r.confirmed}" if r.confirmed else "（没有原始单句音频，未复核）"
-                print(f"  ⚠ {beat.id}[{r.key}] 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}{sure}\n    听到：{r.heard}")
+    with _locked(args.audio, args):  # align 把书签时刻写回 timing.json：不能和 synth 同时改
+        for beat in beats:
+            results = align.align_beat(beat, args.audio, model, align.TRANSCRIBERS[backend])
+            flagged += sum(r.flagged for r in results)
+            for line in align.warnings(results, refs, beat.id):
+                print(f"  ⚠ {line}")
     print(f"完成；需要回听 {flagged} 句")
     return 0
 
@@ -159,7 +201,7 @@ def review_command(args) -> int:
             model, resolution=args.media_resolution, processing=args.media_processing, attempts=args.attempts)
         log_path = out_json.parent / "review_usage.jsonl"
         report = review.review_episode(
-            args.video, reviewer=reviewer, out_json=out_json, model=model, spec=args.spec, audio=args.audio,
+            args.video, reviewer=reviewer, out_json=out_json, model=model, spec=args.spec, audio=args.audio, chapters=args.chapters,
             lang=args.lang, thresholds=thresholds, max_chunk_seconds=args.max_chunk_seconds,
             overlap_seconds=args.overlap_seconds, prompt_version=args.prompt_version,
         )
@@ -188,6 +230,17 @@ def _review_out(video: Path, out: Path | None) -> Path:
 
 
 def pitch_command(doc: dict, beats: list, args) -> int:
+    if args.fix:  # 要重合成、重拼：整个过程独占音频目录（测音高也在锁里，看到的是一致的一组）
+        with _locked(args.audio, args):
+            policy.reconcile(args.audio)
+            try:
+                return _pitch(doc, beats, args)
+            finally:  # 重拼的段按说明提交来源（和当初一样的 model / voice / speed）
+                policy.reconcile(args.audio)
+    return _pitch(doc, beats, args)
+
+
+def _pitch(doc: dict, beats: list, args) -> int:
     import json
 
     from . import pitch, synth
@@ -230,7 +283,8 @@ def pitch_command(doc: dict, beats: list, args) -> int:
         os.environ["GEMINI_TTS_VOICE"] = voice
         # 重合成要用这个 beat 当初实际的语速，不是场景里写的
         speed = policy.beat_speed(args.audio, beat.id, default_speed)
-        synth.synth_beat(beat, args.audio, persona, model, voice, speed, force=names, loose=True)
+        synth.synth_beat(beat, args.audio, persona, model, voice, speed, force=names, loose=True,
+                         before_publish=lambda b=beat.id: policy.mark_pending(args.audio, b))
     after = synth.total_cost(log_path)
     fixed = measure()
     still = [n for n in bad if fixed[n][3]]

@@ -6,6 +6,7 @@
 import json
 import math
 import os
+import shutil
 import struct
 
 import pytest
@@ -267,6 +268,7 @@ def test_legacy_dir_without_manifest_is_not_declared_compliant(tmp_path, clean_e
     out = tmp_path / "audio"
     assert main(["synth", str(scene), "--out", str(out), "--voice", "Puck"]) == 0
     (out / "manifest.json").unlink()  # 模拟升级前的目录：音频还在，来源记录没有
+    shutil.rmtree(out / ".cache")  # 升级前也没有发布说明（有说明时 manifest 会按说明恢复，见 test_sentence_cache）
 
     assert main(["synth", str(scene), "--out", str(out), "--only", "C"]) == 0
     assert "没有来源记录" in capsys.readouterr().err
@@ -286,6 +288,17 @@ def test_beat_with_audio_missing_from_manifest_is_unknown(tmp_path, clean_env, c
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     del manifest["beats"]["B"]  # manifest 里漏了 B，但 B.wav 还在
     (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    # 有发布说明：按说明（sha256 对得上 B.wav）把 B 的来源恢复成 Kore
+    assert main(["synth", str(scene), "--out", str(out), "--only", "C"]) == 0
+    restored = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert restored["beats"]["B"]["voice"] == "Kore" and restored["policy_ok"] is True
+    capsys.readouterr()
+
+    # 没有说明（加缓存之前的目录）：来源不可知
+    del restored["beats"]["B"]
+    (out / "manifest.json").write_text(json.dumps(restored), encoding="utf-8")
+    shutil.rmtree(out / ".cache" / "beats")
 
     assert main(["synth", str(scene), "--out", str(out), "--only", "C"]) == 0
     assert "没有来源记录" in capsys.readouterr().err

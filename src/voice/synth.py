@@ -1,4 +1,4 @@
-"""分句合成：每句一段音频（按文本 + 语气 + 人设 + 模型缓存），按语气留停顿拼成 beat 音频，写出 timing.json。
+"""分句合成：每句一段音频，按语气留停顿拼成 beat 音频，写出 timing.json。
 
 流程沿用 highSchool/lessons/sec6-7/kit/narrate.py：
 - 模型名带 "/"（例如 google/gemini-3.8-flash-tts）走 OpenRouter，风格提示放在 instructions；否则走 Vertex；
@@ -6,20 +6,29 @@
 - speed ≠ 1 时用 ffmpeg atempo 只把人声变速（不变调，原声缓存不受影响），静音不随语速缩放，
   所以 timing.json 的 cues 之间的间隔就是 silence_after，scene_spec 的 SS487 能直接比。
 
+缓存（见 ttscache.py）：每句的原声以 <音频目录>/.cache/tts/<sha256>.wav 为准，键是模型、声音、人设、语气、语言、
+instructions 和送给 TTS 的正文。只改了一句时，同一段的其他句子直接读缓存，不调用 TTS，韵律也不变。
+lines/<beat>-<下标>.wav（+ .json）是给 align 复核和 pitch 用的副本，每次合成按缓存重写，不再当缓存读——
+只有两种例外：升级前合成的、说明完全对得上的副本会被收进缓存（不再花钱重念）；loose 模式（pitch --fix）
+允许沿用人设文案改过之前的副本。
+
 密钥只从环境变量读（--env 指向的文件会被加载进环境），从不打印。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from scene_spec import silence_after
 
-from . import pitch
+from . import pitch, ttscache
 from .audio import wav_seconds
 from .script import Beat
 
@@ -138,14 +147,24 @@ def _to_wav(audio: bytes, out: Path) -> None:
     raw.unlink()
 
 
-def _speed(part: Path, speed: float) -> Path:
-    if abs(speed - 1.0) < 1e-3:
-        return part
-    fast = part.with_name(f"{part.stem}@{speed:g}.wav")
-    if not fast.exists() or fast.stat().st_mtime < part.stat().st_mtime:
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(part), "-filter:a", f"atempo={speed}",
-                        "-ac", "1", "-ar", str(RATE), "-c:a", "pcm_s16le", str(fast)], check=True)
-    return fast
+def _speed(raw: Path, speed: float, cache: Path) -> Path:
+    """变速后的音频，也在缓存里（键是原声字节的 sha256 + speed）；speed = 1 直接用原声。
+
+    原声只读一次：算键的 sha256 和喂给 ffmpeg 的是同一份字节，不会把另一版原声的变速结果记到这一版的键下。
+    """
+    if speed == 1.0:
+        return raw
+    data = raw.read_bytes()
+    # speed 用 repr：完整精度，1.250001 和 1.250002 是两个键（ffmpeg 拿到的 atempo 参数也不同）
+    fields = {"kind": "speed", "source_sha256": hashlib.sha256(data).hexdigest(), "speed": repr(float(speed))}
+    entry_key = ttscache.key(**fields)
+    hit, _ = ttscache.lookup(cache, entry_key, RATE)
+    if hit:
+        return hit
+    tmp = ttscache.scratch(cache, entry_key)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "wav", "-i", "pipe:0", "-filter:a", f"atempo={float(speed)!r}",
+                    "-ac", "1", "-ar", str(RATE), "-c:a", "pcm_s16le", str(tmp)], input=data, check=True)
+    return ttscache.store(cache, entry_key, tmp, RATE, fields)
 
 
 def instructions_for(persona: str, pace: str, lang: str = "zh") -> str:
@@ -154,30 +173,72 @@ def instructions_for(persona: str, pace: str, lang: str = "zh") -> str:
     return f"{PERSONAS.get(persona, PERSONAS['teacher-hs'])}{PACE[pace]}{VERBATIM}{STEADY}"
 
 
-def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, model: str, voice: str,
-               speak: Speak = default_speak, log=print, force: bool = False, loose: bool = False, lang: str = "zh") -> Path:
-    """合成一句（有缓存就直接用）。
+@dataclass
+class Line:
+    audio: Path  # 这句的原声：缓存里的不可变对象（loose 沿用 lines/ 旧副本时，是它的快照）
+    view: Path  # lines/<name>.wav
+    cached: bool  # 没有调用 TTS
 
-    force：不管缓存，重合成。loose：缓存只核对文本、声音和模型，不核对 instructions——
-    只修个别句子时用，免得人设文案改过就把同一段的其他句子全部重念。
-    """
+
+def _view(src: Path, view: Path, stamp: dict) -> None:
+    """把原声复制成 lines/<name>.wav，写上说明；内容没变就不动文件。"""
+    if src != view and (not view.exists() or ttscache.sha256_file(view) != ttscache.sha256_file(src)):
+        tmp = ttscache.temp_path(view)
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, view)
+    ttscache.write_text_atomic(view.with_suffix(".json"), json.dumps(stamp, ensure_ascii=False))
+
+
+def _legacy(view: Path, stamp: dict, keys: tuple[str, ...]) -> bool:
+    """lines/ 里的旧副本能不能用：说明里这些字段都对得上，音频也完好。"""
+    stamp_path = view.with_suffix(".json")
+    if not view.exists() or not stamp_path.exists():
+        return False
+    try:
+        old = json.loads(stamp_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return False
+    return all(old.get(k) == stamp[k] for k in keys) and ttscache.wav_frames(view, RATE) is not None
+
+
+def line_audio(lines_dir: Path, name: str, pace: str, text: str, persona: str, model: str, voice: str,
+               speak: Speak = default_speak, log=print, force: bool = False, loose: bool = False, lang: str = "zh") -> Line:
+    """一句的原声：缓存命中就读盘（不调用 TTS），否则合成、写进缓存。见 synth_line。"""
     lines_dir.mkdir(parents=True, exist_ok=True)
-    wav = lines_dir / f"{name}.wav"
-    stamp_path = wav.with_suffix(".json")
+    cache = ttscache.tts_dir(lines_dir.parent)
+    cache.mkdir(parents=True, exist_ok=True)
+    view = lines_dir / f"{name}.wav"
     instructions = instructions_for(persona, pace, lang)
-    stamp = {"text": text, "instructions": instructions, "voice": voice, "model": model}
-    if not force and wav.exists() and stamp_path.exists():
-        cached = json.loads(stamp_path.read_text(encoding="utf-8"))
-        keys = ("text", "voice", "model") if loose else tuple(stamp)
-        if all(cached.get(k) == stamp[k] for k in keys):
-            return wav
+    fields = {"kind": "tts", "model": model, "voice": voice, "persona": persona, "pace": pace, "lang": lang,
+              "instructions": instructions, "text": text}
+    entry_key = ttscache.key(**fields)
+    stamp = {"text": text, "instructions": instructions, "voice": voice, "model": model, "key": entry_key}
+    if not force:
+        hit, damaged = ttscache.lookup(cache, entry_key, RATE)
+        if hit:
+            _view(hit, view, stamp)
+            return Line(hit, view, True)
+        if damaged:
+            log(f"  ⚠ {name} 的缓存坏了（{damaged}），重合成")
+        elif _legacy(view, stamp, ("text", "instructions", "voice", "model")):  # 升级前的副本：收进缓存
+            tmp = ttscache.scratch(cache, entry_key)
+            shutil.copyfile(view, tmp)
+            entry = ttscache.store(cache, entry_key, tmp, RATE, fields)
+            _view(entry, view, stamp)
+            return Line(entry, view, True)
+        if loose and _legacy(view, stamp, ("text", "voice", "model")):
+            # 人设文案改过之前的副本：不记到现在的键下（它不是用现在的 instructions 念的），只拍一个不可变快照来拼
+            tmp = ttscache.scratch(cache, name)
+            shutil.copyfile(view, tmp)
+            return Line(ttscache.put_object(cache, tmp, RATE)[0], view, True)
+    tmp = ttscache.scratch(cache, entry_key)
     best: tuple[float, bytes, float] | None = None
     for attempt in range(1, PITCH_RETRIES + 1):
         audio = speak(instructions, text, model)
-        _to_wav(audio, wav)
-        seconds = wav_seconds(wav)
+        _to_wav(audio, tmp)
+        seconds = wav_seconds(tmp)
         cost = log_usage(lines_dir.parent / "tts_usage.jsonl", name, model, text, instructions, seconds)
-        f0 = pitch.median_f0(wav)
+        f0 = pitch.median_f0(tmp)
         log(f"  合成 {name} {seconds:.1f}s，音高 {f0:.0f} Hz，约 ${cost:.4f}")
         if not pitch.off_voice(f0, voice):
             best = None
@@ -186,10 +247,21 @@ def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
             best = (pitch.closeness(f0, voice), audio, f0)
         log(f"  ⚠ {name} 音高 {f0:.0f} Hz，不像 {voice}（像换了声音），重合成（第 {attempt}/{PITCH_RETRIES} 次）")
     if best is not None:
-        _to_wav(best[1], wav)
+        _to_wav(best[1], tmp)
         log(f"  ⚠ {name} 重试 {PITCH_RETRIES} 次仍像换了声音，留下最接近的一版（{best[2]:.0f} Hz），请回听")
-    stamp_path.write_text(json.dumps(stamp, ensure_ascii=False), encoding="utf-8")
-    return wav
+    entry = ttscache.store(cache, entry_key, tmp, RATE, fields)
+    _view(entry, view, stamp)
+    return Line(entry, view, False)
+
+
+def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, model: str, voice: str,
+               speak: Speak = default_speak, log=print, force: bool = False, loose: bool = False, lang: str = "zh") -> Path:
+    """合成一句（有缓存就直接用），返回 lines/<name>.wav。
+
+    force：不读缓存，重合成并刷新缓存。loose：缓存没命中时，lines/ 里的旧副本只要文本、声音和模型对得上
+    就沿用，不核对 instructions——只修个别句子时用，免得人设文案改过就把同一段的其他句子全部重念。
+    """
+    return line_audio(lines_dir, name, pace, text, persona, model, voice, speak, log, force, loose, lang).view
 
 
 def estimate_cost(text: str, instructions: str, seconds: float) -> float:
@@ -218,29 +290,86 @@ def total_cost(path: Path) -> tuple[int, float]:
 
 
 def synth_beat(beat: Beat, out_dir: Path, persona: str, model: str, voice: str, speed: float = 1.0,
-               speak: Speak = default_speak, log=print, force: set[str] | None = None, loose: bool = False) -> dict:
-    """force：这些句子（<beat>-<index>）不管缓存重合成；loose 见 synth_line。"""
+               speak: Speak = default_speak, log=print, force: set[str] | None = None, loose: bool = False,
+               no_cache: bool = False, reassemble: bool = False, before_publish: Callable[[], None] | None = None) -> dict:
+    """合成一段：逐句查缓存，只给没命中的句子调用 TTS，再按 silence_after 拼成 <beat>.wav、写 timing.json。
+
+    force：这些句子（<beat>-<index>）不读缓存，重合成并刷新缓存；no_cache：这一段的每一句都这样（CLI 的 --no-cache）。
+    loose 见 synth_line。句子音频和停顿都和上次拼的时候一样，就沿用现有的 <beat>.wav 和 timing.json；
+    reassemble（CLI 的 --force）照样重拼——句子仍然读缓存。
+    沿用时 align 写进 timing.json 的书签时刻只在句子 key 和书签位置也没变时保留，否则清掉（要重新 align）。
+    发布：before_publish()（CLI 用它在 manifest 里预写 pending）→ 预写 beats-next 说明 → 换 wav → 写 timing.json →
+    写说明（wav 的 sha256、cues、model / voice / speed）。说明的 sha256 对不上 wav 就不会沿用，所以中途被打断下次一定重拼；
+    manifest 怎么靠这两份说明恢复见 policy.py。
+    这里不加锁：和别人共用音频目录时，调用方要持有 ttscache.dir_lock（CLI 的 synth / pitch --fix 整个运行都持有）。
+    """
     if not beat.sentences:
         return {}
-    parts = [
-        _speed(synth_line(out_dir / "lines", f"{beat.id}-{s.index}", s.pace, s.spoken, persona, model, voice, speak, log,
-                          force=f"{beat.id}-{s.index}" in (force or set()), loose=loose, lang=s.lang), speed)
-        for s in beat.sentences
-    ]
+    cache = ttscache.tts_dir(out_dir)
+    lines = [line_audio(out_dir / "lines", f"{beat.id}-{s.index}", s.pace, s.spoken, persona, model, voice, speak, log,
+                        force=no_cache or f"{beat.id}-{s.index}" in (force or set()), loose=loose, lang=s.lang)
+             for s in beat.sentences]
+    parts = [_speed(line.audio, speed, cache) for line in lines]
+    cached = sum(line.cached for line in lines)
+    counts = f"{cached} cached, {len(lines) - cached} synthesized"
+    gaps = [round(silence_after(s.text, s.hold), 3) if k + 1 < len(parts) else 0.0 for k, s in enumerate(beat.sentences)]
+    # 来源也在指纹里：换了声音，哪怕音频字节碰巧一样，也重新发布、重新记来源
+    fingerprint = ttscache.key(kind="beat", lead=LEAD, rate=RATE, gaps=gaps, parts=[ttscache.sha256_file(p) for p in parts],
+                               model=model, voice=voice, speed=repr(float(speed)))
+    # 对齐结果（marks / check / words）按句子 key 存，书签按它在读法文本里的位置求：这些变了，旧的对齐就作废
+    script_fp = ttscache.key(kind="script", sentences=[[s.key, s.spoken, sorted(s.marks.items())] for s in beat.sentences])
+    wav, timing_path = out_dir / f"{beat.id}.wav", out_dir / f"{beat.id}.timing.json"
+    stamp_path = ttscache.beats_dir(out_dir) / f"{beat.id}.json"
+    published = None if reassemble or no_cache else _published(wav, timing_path, stamp_path, fingerprint)
+    if published is not None:
+        stamp, timing = published
+        if stamp.get("script") == script_fp:
+            log(f"{beat.id}: {counts}；句子和停顿都没变，沿用 {wav.name} 和 {timing_path.name}（--force 重拼）")
+            return timing
+        timing = {"cues": timing["cues"], "total": timing["total"]}
+        ttscache.write_text_atomic(timing_path, json.dumps(timing, ensure_ascii=False, indent=1))
+        ttscache.write_text_atomic(stamp_path, json.dumps({**stamp, "script": script_fp}))
+        log(f"{beat.id}: {counts}；音频没变，沿用 {wav.name}；句子 id 或书签位置变了，"
+            f"清掉 {timing_path.name} 里过期的对齐结果（要重新 align）")
+        return timing
     cues, cursor, inputs, filters = [], LEAD, [], []
-    for k, (s, part) in enumerate(zip(beat.sentences, parts)):
+    for k, (part, gap) in enumerate(zip(parts, gaps)):
         seconds = wav_seconds(part)
         cues.append({"start": round(cursor, 3), "end": round(cursor + seconds, 3)})
-        gap = round(silence_after(s.text, s.hold), 3) if k + 1 < len(parts) else 0.0
         inputs += ["-i", str(part)]
         filters.append(f"[{k}:a]apad=pad_dur={gap:.3f}[a{k}]")
         cursor += seconds + gap
     joined = "".join(f"[a{k}]" for k in range(len(parts)))
     filters.append(f"aevalsrc=0:d={LEAD}:s={RATE}[lead]")
     filters.append(f"[lead]{joined}concat=n={len(parts) + 1}:v=0:a=1[out]")
+    tmp = ttscache.temp_path(wav)
     subprocess.run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(filters), "-map", "[out]",
-                    "-ac", "1", "-ar", str(RATE), "-c:a", "pcm_s16le", str(out_dir / f"{beat.id}.wav")], check=True)
+                    "-ac", "1", "-ar", str(RATE), "-c:a", "pcm_s16le", str(tmp)], check=True)
     timing = {"cues": cues, "total": round(cursor, 3)}
-    (out_dir / f"{beat.id}.timing.json").write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
-    log(f"{beat.id}: {len(parts)} 句，{cursor:.1f}s")
+    stamp = {"fingerprint": fingerprint, "script": script_fp, "wav_sha256": ttscache.sha256_file(tmp), **timing,
+             "model": model, "voice": voice, "speed": float(speed)}
+    if before_publish is not None:
+        before_publish()
+    next_path = ttscache.next_dir(out_dir) / f"{beat.id}.json"
+    ttscache.write_text_atomic(next_path, json.dumps(stamp))
+    os.replace(tmp, wav)
+    ttscache.write_text_atomic(timing_path, json.dumps(timing, ensure_ascii=False, indent=1))
+    ttscache.write_text_atomic(stamp_path, json.dumps(stamp))
+    next_path.unlink(missing_ok=True)
+    log(f"{beat.id}: {counts}；{len(parts)} 句，{cursor:.1f}s")
     return timing
+
+
+def _published(wav: Path, timing_path: Path, stamp_path: Path, fingerprint: str) -> tuple[dict, dict] | None:
+    """已经发布的这一段还能不能沿用：说明里的指纹是这次的，wav 的 sha256 和 timing.json 的 cues / total 都和说明一致。
+    能就返回 (说明, timing.json)。"""
+    try:
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(stamp, dict) or not isinstance(timing, dict) or stamp.get("fingerprint") != fingerprint
+            or not wav.exists() or stamp.get("wav_sha256") != ttscache.sha256_file(wav)
+            or timing.get("cues") != stamp.get("cues") or timing.get("total") != stamp.get("total")):
+        return None
+    return stamp, timing

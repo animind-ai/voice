@@ -1,0 +1,23 @@
+spec: '0.1'
+meta:
+  id: trace-demo
+  title: 追溯演示
+beats:
+  - id: Hook
+    say:
+      - id: h1
+        pace: normal
+        text: 先看这道题。
+      - {id: h2, pace: ask, text: '你猜答案是多少？'}
+  - id: Think
+    pause: {type: think, hold: 3}
+    say:
+      - {pace: normal, text: '停下来想一想。'}
+  - id: Show
+    title: 只有画面
+  - id: Solve
+    say:
+      - {pace: normal, text: '先算差。'}
+      - id: s2
+        pace: slow
+        text: '再把差加回去。'
