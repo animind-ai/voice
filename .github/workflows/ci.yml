@@ -27,6 +27,6 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      - run: uv sync   # 不装 align 附加依赖：mlx-whisper 只能在 Apple 芯片上跑，测试里用假的 transcriber
+      - run: uv sync --extra review   # 不装 align：mlx-whisper 只能在 Apple 芯片上跑。review 带上 google-genai，测视频 Part 的字段；审片用例本身不联网
       - run: uvx ruff check .
       - run: uv run pytest -q

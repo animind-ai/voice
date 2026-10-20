@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://animind.ai/schemas/review-response-v1.json",
+  "title": "animind review model response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "issues"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "issues": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/issue"}
+    }
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "severity", "start", "end", "evidence", "suggested_fix"],
+      "properties": {
+        "category": {
+          "enum": [
+            "layout_overlap",
+            "out_of_frame",
+            "legibility",
+            "av_sync",
+            "tts_pronunciation",
+            "tts_filler",
+            "tts_voice_drift",
+            "pedagogy",
+            "math",
+            "seam",
+            "other"
+          ]
+        },
+        "severity": {"enum": ["info", "minor", "major", "blocker"]},
+        "start": {"type": "number", "minimum": 0},
+        "end": {"type": "number", "minimum": 0},
+        "evidence": {"type": "string", "minLength": 1},
+        "suggested_fix": {"type": "string", "minLength": 1},
+        "beat": {"type": "string"},
+        "sentence": {"type": "string"}
+      }
+    }
+  }
+}
