@@ -59,7 +59,7 @@ def test_synth_beat_with_fake_speaker(tmp_path):
     assert calls == ["第一句。", "第二句？"]  # 书签不念
     assert timing["cues"][0]["start"] == synth.LEAD
     gap = timing["cues"][1]["start"] - timing["cues"][0]["end"]
-    assert abs(gap - synth.GAP["normal"]) < 0.01  # 停顿由说完的那一句的语气决定
+    assert abs(gap - 0.45) < 0.01  # 句号的 silence_after；停顿由说完的那一句的标点决定
     with wave.open(str(tmp_path / "B.wav")) as w:
         assert abs(w.getnframes() / w.getframerate() - timing["total"]) < 0.05
     # 第二次走缓存，不再调用

@@ -1,11 +1,13 @@
 """命令行：
 
-    animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0] [--lang en]
+    animind-voice synth SPEC --out 音频目录 --env 密钥文件 [--model M] [--voice V] [--speed 1.0] [--allow-env-voice] [--lang en]
     animind-voice align SPEC --audio 音频目录 [--backend mlx|faster] [--model 对齐模型] [--lang en]
     animind-voice pitch SPEC --audio 音频目录 [--fix --env 密钥文件] [--lang en]
     animind-voice review EPISODE.mp4 [--spec SPEC] [--audio 音频目录] [--env 密钥文件] [--model M] [--out 报告.json]
 
-synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json；
+synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读法风险提示，再逐句合成并拼出 <beat>.wav + <beat>.timing.json，
+写出 manifest.json（实际用的 model / voice / speed）和 timing-report.json（给 scene-spec check --timing 用）。
+声音以场景的 style.voice 为准；--model/--voice/--speed 显式覆盖；GEMINI_TTS_* 环境变量只有 --allow-env-voice 或 VOICE_ALLOW_ENV_OVERRIDE=1 才采用；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
 review 把成片（可带场景稿和 timing）交给 Gemini 看画面和声音，写出 JSON 报告和一份短 Markdown。退出码：0 通过，1 未通过，2 用法或调用失败。
@@ -21,8 +23,9 @@ from pathlib import Path
 
 from scene_spec import localize
 from scene_spec.loader import load_file
+from scene_spec.quality import REQUIRED_MODEL, REQUIRED_SPEED, REQUIRED_VOICE
 
-from . import script
+from . import policy, script, timing_report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,9 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("spec", type=Path)
     s.add_argument("--out", type=Path, required=True)
     s.add_argument("--env", type=Path, help="含 OPENROUTER_API_KEY / GEMINI_TTS_* 的文件；不会打印其内容")
-    s.add_argument("--model", help="默认取环境变量 GEMINI_TTS_MODEL")
-    s.add_argument("--voice", help="默认取环境变量 GEMINI_TTS_VOICE")
-    s.add_argument("--speed", type=float, help="默认取 scene-spec 的 style.voice.speed，没有则 1.0")
+    s.add_argument("--model", help="覆盖场景 style.voice.model（会提示）；默认按场景，没写则 google/gemini-3.8-flash-tts")
+    s.add_argument("--voice", help="覆盖场景 style.voice.voice（会提示）；默认按场景，没写则 Kore")
+    s.add_argument("--speed", type=float, help="覆盖场景 style.voice.speed（会提示）；默认按场景，没写则 1.0")
+    s.add_argument("--allow-env-voice", action="store_true",
+                   help="允许 GEMINI_TTS_MODEL / GEMINI_TTS_VOICE 覆盖场景的声音（会大声警告）；也可设 VOICE_ALLOW_ENV_OVERRIDE=1")
     s.add_argument("--only", nargs="*", default=[], help="只处理这些 beat")
     a = sub.add_parser("align", help="Whisper 对齐书签 + 回听检查")
     a.add_argument("spec", type=Path)
@@ -72,7 +77,12 @@ def main(argv: list[str] | None = None) -> int:
         return review_command(args)
 
     doc = localize(load_file(args.spec), args.lang)
-    beats = [b for b in script.beats(doc) if not args.only or b.id in args.only]
+    try:
+        all_beats = script.beats(doc)
+    except ValueError as exc:
+        print(f"{args.spec}: {exc}", file=sys.stderr)
+        return 2
+    beats = [b for b in all_beats if not args.only or b.id in args.only]
 
     if args.command == "pitch":
         return pitch_command(doc, beats, args)
@@ -90,21 +100,34 @@ def main(argv: list[str] | None = None) -> int:
             print(f"读法检查：{warned} 条提示（只提示，不拦截合成；改 say 文本后会重新合成这一句）")
 
         synth.load_env(args.env)
-        voice_style = doc.get("style", {}).get("voice", {})
-        model = args.model or os.environ.get("GEMINI_TTS_MODEL")
-        voice = args.voice or os.environ.get("GEMINI_TTS_VOICE")
-        if not model or not voice:
-            print("缺少 TTS 模型或声音：用 --model/--voice，或在 --env 文件里设 GEMINI_TTS_MODEL / GEMINI_TTS_VOICE", file=sys.stderr)
+        try:
+            choice = policy.resolve(doc, model=args.model, voice=args.voice, speed=args.speed,
+                                    allow_env=policy.env_override_allowed(os.environ, args.allow_env_voice))
+        except ValueError as exc:
+            print(f"{args.spec}: {exc}", file=sys.stderr)
             return 2
-        os.environ["GEMINI_TTS_VOICE"] = voice
-        speed = args.speed or float(voice_style.get("speed", 1.0))
+        for line in choice.notices:
+            print(f"提示：{line}", file=sys.stderr)
+        for line in choice.warnings:
+            print(line, file=sys.stderr)
+        if not choice.policy_ok:
+            print(f"WARNING: 这批音频不符合发布政策（{'；'.join(choice.policy_problems())}）。"
+                  f"发布要求 {REQUIRED_MODEL}、{REQUIRED_VOICE}、语速 {REQUIRED_SPEED:g}；这批输出不可发布。", file=sys.stderr)
+        # speak 函数从 GEMINI_TTS_VOICE 读声音（OpenRouter 的 body / Vertex 的 voice_name），这里填入实际用的那个
+        os.environ["GEMINI_TTS_VOICE"] = choice.voice
         args.out.mkdir(parents=True, exist_ok=True)
         log_path = args.out / "tts_usage.jsonl"
         before = synth.total_cost(log_path)
+        persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
         for beat in beats:
-            synth.synth_beat(beat, args.out, voice_style.get("persona", "teacher-hs"), model, voice, speed)
+            synth.synth_beat(beat, args.out, persona, choice.model, choice.voice, choice.speed, speak=synth.default_speak)
         after = synth.total_cost(log_path)
+        done = [b.id for b in beats if (args.out / f"{b.id}.timing.json").exists()]
+        for conflict in policy.write_manifest(args.out, choice, args.lang, done):
+            print(f"WARNING: {args.out}：{conflict}", file=sys.stderr)
+        report = timing_report.write(all_beats, args.out)
         print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
+        print(f"模型 {choice.model}，声音 {choice.voice}，语速 {choice.speed:g}；时间报告 {report}")
         return 0
 
     from . import align
@@ -196,7 +219,7 @@ def pitch_command(doc: dict, beats: list, args) -> int:
 
     synth.load_env(args.env)
     persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
-    speed = float(doc.get("style", {}).get("voice", {}).get("speed", 1.0))
+    default_speed = float(doc.get("style", {}).get("voice", {}).get("speed", 1.0))
     log_path = args.audio / "tts_usage.jsonl"
     before = synth.total_cost(log_path)
     for beat in beats:
@@ -205,6 +228,8 @@ def pitch_command(doc: dict, beats: list, args) -> int:
             continue
         _, voice, model, _ = rows[sorted(names)[0]]
         os.environ["GEMINI_TTS_VOICE"] = voice
+        # 重合成要用这个 beat 当初实际的语速，不是场景里写的
+        speed = policy.beat_speed(args.audio, beat.id, default_speed)
         synth.synth_beat(beat, args.audio, persona, model, voice, speed, force=names, loose=True)
     after = synth.total_cost(log_path)
     fixed = measure()
