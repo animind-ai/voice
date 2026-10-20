@@ -366,10 +366,14 @@ def parse_model_output(text: str, *, chunk_len: float) -> dict:
         end = _as_float(raw.get("end"), f"issues[{index}].end")
         if end < start:
             raise ReviewSchemaError(f"issues[{index}] 的 end 早于 start")
+        # 段尾允许多报 50ms。只夹终点会得到 start > end，报告校验会在 schema 重试之外失败。
         if start > chunk_len + 0.05:
             raise ReviewSchemaError(
                 f"issues[{index}].start={start:.3f} 超出本段 {chunk_len:.3f}s，时间要从本段开头算")
+        start = min(start, chunk_len)
         end = min(end, chunk_len)
+        if end < start:
+            raise ReviewSchemaError(f"issues[{index}] 的 end 早于 start")
         issue = {
             "category": category,
             "severity": severity,
@@ -407,29 +411,51 @@ def _evidence_similar(left: str, right: str) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= EVIDENCE_SIMILARITY
 
 
+def _source_chunks(issue: dict) -> frozenset:
+    """一条问题来自哪些窗口。没有窗口号的记成同一个占位，这样它们不会互相合并。"""
+    raw = issue.get("_chunks")
+    if raw:
+        return frozenset(raw)
+    chunk = issue.get("chunk")
+    if isinstance(chunk, int) and not isinstance(chunk, bool):
+        return frozenset((chunk,))
+    return frozenset(("_",))
+
+
 def dedupe_issues(issues: list[dict]) -> list[dict]:
-    """只合并相邻窗口里、时间和证据都对得上的同一条。同一段里的问题全部留下。"""
+    """跨窗口一一合并时间和证据都对得上的同一条。同一窗口的问题全部留下。
+
+    合并结果记下每一个来源窗口。两条只要共用一个来源窗口就不再合并，所以每个窗口
+    在一条结果里最多出现一次。
+    """
     ordered = sorted(issues, key=lambda item: (item["start"], -SEVERITY_RANK[item["severity"]]))
     kept: list[dict] = []
     for issue in ordered:
+        incoming = _source_chunks(issue)
         match = next((prev for prev in kept
-                      if prev.get("chunk") != issue.get("chunk")
+                      if prev["_chunks"].isdisjoint(incoming)
                       and prev["category"] == issue["category"]
                       and _overlap_fraction(prev, issue) >= 0.5
                       and _evidence_similar(prev["evidence"], issue["evidence"])), None)
         if match is None:
-            kept.append(dict(issue))
+            copy = dict(issue)
+            copy["_chunks"] = set(incoming)
+            kept.append(copy)
             continue
         if SEVERITY_RANK[issue["severity"]] > SEVERITY_RANK[match["severity"]]:
             match["severity"] = issue["severity"]
             match["evidence"] = issue["evidence"]
             match["suggested_fix"] = issue["suggested_fix"]
-            match["chunk"] = issue["chunk"]
+            if "chunk" in issue:
+                match["chunk"] = issue["chunk"]
             for key in ("beat", "sentence"):
                 if issue.get(key):
                     match[key] = issue[key]
         match["start"] = round(min(match["start"], issue["start"]), 3)
         match["end"] = round(max(match["end"], issue["end"]), 3)
+        match["_chunks"] |= incoming
+    for item in kept:
+        item.pop("_chunks", None)
     return kept
 
 

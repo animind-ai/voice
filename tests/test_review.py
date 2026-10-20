@@ -443,6 +443,96 @@ def test_dedupe_keeps_same_segment_and_dissimilar_math_errors():
     assert {item["evidence"] for item in across} == {"A8 写成 120，应为 121。", "公差写成 2，应为 3。"}
 
 
+def test_cross_chunk_dedupe_is_one_to_one_per_source_chunk():
+    # 窗口 0 只有 A8；窗口 1 在重叠处同时报了 A8 和另一个很像的 A9。
+    # 旧逻辑合并后只留一个 chunk，A9 会再并进去，三条变成一条。
+    a8 = "黑板上 A8 写成 120，应为 121。"
+    a8_again = "黑板把 A8 写成 120，应为 121。"
+    a9 = "黑板上 A9 写成 130，应为 131。"
+    merged = review.dedupe_issues([
+        {"category": "math", "severity": "minor", "start": 14.0, "end": 18.0,
+         "evidence": a8, "suggested_fix": "改成 121。", "chunk": 0},
+        {"category": "math", "severity": "minor", "start": 14.2, "end": 18.2,
+         "evidence": a8_again, "suggested_fix": "改成 121。", "chunk": 1},
+        {"category": "math", "severity": "minor", "start": 16.0, "end": 20.0,
+         "evidence": a9, "suggested_fix": "改成 131。", "chunk": 1},
+    ])
+    assert len(merged) == 2
+    assert {item["evidence"] for item in merged} == {a8, a9}
+    assert all("_chunks" not in item for item in merged)
+    passed, violations = review.decide(
+        merged, {"fail_severities": [], "max_counts": {"minor": 1}, "fail_categories": {}})
+    assert passed is False and violations
+
+
+def test_similar_cross_chunk_pair_does_not_hide_a_second_issue(tmp_path):
+    first = json.dumps({
+        "summary": "前一段里 A8 算错了。",
+        "issues": [{
+            "category": "math", "severity": "minor", "start": 14, "end": 18,
+            "evidence": "黑板上 A8 写成 120，应为 121。", "suggested_fix": "改成 121。",
+        }],
+    }, ensure_ascii=False)
+    second = json.dumps({
+        "summary": "接缝处 A8 还在，旁边 A9 也错了。",
+        "issues": [
+            {"category": "math", "severity": "minor", "start": 2.2, "end": 6.2,
+             "evidence": "黑板把 A8 写成 120，应为 121。", "suggested_fix": "改成 121。"},
+            {"category": "math", "severity": "minor", "start": 4, "end": 8,
+             "evidence": "黑板上 A9 写成 130，应为 131。", "suggested_fix": "改成 131。"},
+        ],
+    }, ensure_ascii=False)
+    thresholds = {"fail_severities": [], "max_counts": {"minor": 1}, "fail_categories": {}}
+    report, _, _ = _run(
+        tmp_path, [first, second], duration=30, max_chunk=20, overlap=8, thresholds=thresholds)
+    assert len(report["issues"]) == 2
+    assert report["passed"] is False
+    assert any(item["code"] == "RV001" for item in report["gate"]["issues"])
+    assert {item["evidence"] for item in report["issues"]} == {
+        "黑板上 A8 写成 120，应为 121。",
+        "黑板上 A9 写成 130，应为 131。",
+    }
+
+
+def test_segment_end_tolerance_clamps_both_ends(tmp_path):
+    parsed = review.parse_model_output(
+        '{"summary": "段尾有一处。", "issues": [{"category": "math", "severity": "minor", '
+        '"start": 10.04, "end": 10.04, "evidence": "A8 写成 120，应为 121。", "suggested_fix": "改成 121。"}]}',
+        chunk_len=10,
+    )
+    issue = parsed["issues"][0]
+    assert issue["start"] == 10 and issue["end"] == 10
+    inside = review.parse_model_output(
+        '{"summary": "段尾有一处。", "issues": [{"category": "math", "severity": "minor", '
+        '"start": 9.5, "end": 10.04, "evidence": "A8 写成 120，应为 121。", "suggested_fix": "改成 121。"}]}',
+        chunk_len=10,
+    )
+    assert inside["issues"][0]["start"] == 9.5 and inside["issues"][0]["end"] == 10
+    with pytest.raises(review.ReviewSchemaError):
+        review.parse_model_output(
+            '{"summary": "段尾有一处。", "issues": [{"category": "math", "severity": "minor", '
+            '"start": 10.06, "end": 10.06, "evidence": "A8 写成 120，应为 121。", "suggested_fix": "改成 121。"}]}',
+            chunk_len=10,
+        )
+
+    first = json.dumps({
+        "summary": "非最后一段的末尾多报了 40ms。",
+        "issues": [{
+            "category": "math", "severity": "minor", "start": 10.04, "end": 10.04,
+            "evidence": "A8 写成 120，应为 121。", "suggested_fix": "改成 121。",
+        }],
+    }, ensure_ascii=False)
+    second = json.dumps({"summary": "后一段没有问题。", "issues": []}, ensure_ascii=False)
+    report, scripted, _ = _run(
+        tmp_path, [first, second], duration=20, max_chunk=10, overlap=0,
+        thresholds={"fail_severities": [], "max_counts": {}, "fail_categories": {}},
+    )
+    assert len(scripted.seen) == 2
+    assert report["issues"][0]["start"] == 10 and report["issues"][0]["end"] == 10
+    assert (tmp_path / "out" / "episode.review.json").exists()
+    assert (tmp_path / "out" / "episode.review.md").exists()
+
+
 def test_two_minor_issues_in_one_segment_still_trip_the_cap(tmp_path):
     text = json.dumps({
         "summary": "同一段里有两处不同的计算错误。",
