@@ -19,9 +19,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import heard, textalign
+from . import heard, policy, textalign
 from .audio import slice_16k
 from .script import Beat, Sentence
+from .ttscache import write_text_atomic
+
+
+class Inconsistent(ValueError):
+    """这一段的 wav、timing.json 和发布说明对不上（policy.check_beat），不能对齐。"""
+
 
 BACKENDS = ("mlx", "faster")
 DEFAULT_MODELS = {
@@ -246,6 +252,10 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
         return []
     if not timing_path.exists() or not wav.exists():
         raise FileNotFoundError(f"{beat.id}：缺少 {wav.name} 或 {timing_path.name}，先运行 synth")
+    check = policy.check_beat(audio_dir, beat.id)
+    if not check.clean:  # 按对不上 wav 的 cues 去切音频，书签时刻全是错的
+        raise Inconsistent(f"{beat.id}：{check.describe()}，不对齐。"
+                           f"先运行 synth（能修的会按发布说明修好；修不好的要重合成：synth --only {beat.id}）")
     timing = json.loads(timing_path.read_text(encoding="utf-8"))
     cues = timing["cues"]
     if len(cues) != len(beat.sentences):
@@ -264,7 +274,7 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
     timing["words"] = {r.key: {"n": r.content, "at": r.words} for r in results if r.words}
     timing["how"] = {r.key: r.how for r in results if r.how}  # 每个书签：matched / interpolated / estimated
     timing["aligner"] = model
-    timing_path.write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_text_atomic(timing_path, json.dumps(timing, ensure_ascii=False, indent=1))
     flagged = [r.key for r in results if r.flagged]
     est = sum(1 for r in results for h in r.how.values() if h != "matched")
     log(f"{beat.id}: {len(results)} 句，书签 {sum(len(r.marks) for r in results)} 个（精确匹配率 {match_rate(results):.0%}，非精确匹配 {est}），需要回听 {flagged or '无'}")

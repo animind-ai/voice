@@ -7,8 +7,10 @@ import os
 import struct
 
 import pytest
+from scene_spec.loader import load_file
 
-from voice import policy, synth, ttscache
+from voice import align, policy, script, synth, timing_report, ttscache
+from voice.audio import wav_seconds
 from voice.cli import main
 
 SCENE = """meta:
@@ -147,12 +149,124 @@ def test_interrupted_publication_never_overclaims_and_self_heals(episode, monkey
     assert manifest(out)["policy_ok"] is True and manifest(out)["mixed"] is False
 
 
-def test_wav_replaced_outside_synth_is_marked_unknown(episode):
+def report(out):
+    return json.loads((out / timing_report.REPORT_NAME).read_text(encoding="utf-8"))
+
+
+def timing(out, beat_id="Hook"):
+    return json.loads((out / f"{beat_id}.timing.json").read_text(encoding="utf-8"))
+
+
+def fake_align(out, beat_id="Hook"):
+    """假装 align 跑过：timing.json 里有对齐结果。"""
+    data = timing(out, beat_id)
+    data.update(marks={"s1": {"a": 0.5}}, check={"s1": {"ratio": 1.0}}, words={"s1": {"n": 3, "at": []}}, aligner="fake")
+    (out / f"{beat_id}.timing.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def lengthen_hook(scene):
+    scene.write_text(SCENE.replace("第二句？", "第二句改得长了很多很多很多很多很多？"), encoding="utf-8")
+
+
+def assert_timing_matches_wav(out, beat_id="Hook"):
+    """timing.json 和时间报告里的 cues 都是现在这个 wav 的（说明记着 wav 的 sha256 和它的 cues）。"""
+    stamp = json.loads((ttscache.beats_dir(out) / f"{beat_id}.json").read_text())
+    assert stamp["wav_sha256"] == ttscache.sha256_file(out / f"{beat_id}.wav")
+    assert timing(out, beat_id) == {"cues": stamp["cues"], "total": stamp["total"]}  # 对齐结果清掉了
+    assert abs(wav_seconds(out / f"{beat_id}.wav") - stamp["total"]) < 0.05
+    assert report(out)["beats"][beat_id]["cues"] == stamp["cues"] and "excluded" not in report(out)
+    assert not (ttscache.next_dir(out) / f"{beat_id}.json").exists()
+
+
+def test_same_voice_edit_interrupted_after_wav_restores_timing_from_stamp(episode, monkeypatch, capsys):
+    """同样是 Kore：改长 Hook 的一句，换了 wav、还没写 timing.json 就断了；下次只合成 Next，
+    Hook 的 timing.json 和时间报告要按说明换成新 wav 的 cues，旧的对齐结果清掉，manifest 照实说合规。"""
     scene, out, kore = episode
-    (out / "Hook.wav").write_bytes((out / "Next.wav").read_bytes())  # 有人手动换了音频：哪份说明都对不上
+    fake_align(out)
+    old_total = timing(out)["total"]
+    lengthen_hook(scene)
+    with monkeypatch.context() as m:
+        crash_at(m, out, "after_wav")
+        with pytest.raises(Crash):
+            main(["synth", str(scene), "--out", str(out), "--only", "Hook"])
+    assert ttscache.sha256_file(out / "Hook.wav") != kore["Hook"] and timing(out)["total"] == old_total  # 半套
+    assert not policy.check_beat(out, "Hook").publishable
+
+    capsys.readouterr()
     assert main(["synth", str(scene), "--out", str(out), "--only", "Next"]) == 0
+    assert_timing_matches_wav(out)
+    assert timing(out)["total"] > old_total + 0.3
+    hook = manifest(out)["beats"]["Hook"]
+    assert hook == {"model": "google/gemini-3.8-flash-tts", "voice": "Kore", "speed": 1.0, "policy_ok": True}
+    assert manifest(out)["policy_ok"] is True
+    assert "按发布说明修复：Hook: timing.json 按发布说明恢复" in capsys.readouterr().err
+    assert policy.check_beat(out, "Hook").clean
+
+    # 修好之后就是一致的一套：再合成 Hook 直接沿用，不重拼
+    assert main(["synth", str(scene), "--out", str(out), "--only", "Hook"]) == 0
+    assert "沿用 Hook.wav" in capsys.readouterr().out
+
+
+def test_interrupted_after_timing_before_stamp_commits_pending_stamp(episode, monkeypatch, capsys):
+    scene, out, kore = episode
+    lengthen_hook(scene)
+    with monkeypatch.context() as m:
+        crash_at(m, out, "after_timing")
+        with pytest.raises(Crash):
+            main(["synth", str(scene), "--out", str(out), "--only", "Hook"])
+    assert (ttscache.next_dir(out) / "Hook.json").exists()
+
+    capsys.readouterr()
+    assert main(["synth", str(scene), "--out", str(out), "--only", "Next"]) == 0
+    assert_timing_matches_wav(out)
+    assert manifest(out)["beats"]["Hook"]["policy_ok"] is True and manifest(out)["policy_ok"] is True
+    err = capsys.readouterr().err
+    assert "按发布说明修复：Hook: 提交了被打断的发布说明" in err and "timing.json 按发布说明恢复" not in err
+
+
+def test_wav_replaced_outside_synth_fails_loudly(episode, capsys):
+    scene, out, kore = episode
+    stale = timing(out)
+    (out / "Hook.wav").write_bytes((out / "Next.wav").read_bytes())  # 有人手动换了音频：哪份说明都对不上
+    capsys.readouterr()
+    assert main(["synth", str(scene), "--out", str(out), "--only", "Next"]) == 1
+    err = capsys.readouterr().err
+    assert "错误：Hook：Hook.wav 和发布说明都对不上" in err and "--only Hook" in err
     data = manifest(out)
-    assert data["beats"]["Hook"]["unknown"] is True and data["policy_ok"] is False
+    assert data["beats"]["Hook"]["unknown"] is True and data["beats"]["Hook"]["policy_ok"] is False
+    assert data["policy_ok"] is False
+    assert "Hook" not in report(out)["beats"] and "Hook" in report(out)["excluded"]  # 旧 cues 不再发布
+    assert "Next" in report(out)["beats"]
+    assert timing(out) == stale  # 不猜：原样留着，等重合成
+
+    # 这次就重合成 Hook：修好，退出 0
+    assert main(["synth", str(scene), "--out", str(out), "--only", "Hook"]) == 0
+    assert "这次会重合成它" in capsys.readouterr().err
+    assert_timing_matches_wav(out)
+    assert manifest(out)["policy_ok"] is True
+
+
+@pytest.mark.parametrize("damage", ["swapped", "interrupted"])
+def test_align_refuses_inconsistent_beat(episode, monkeypatch, capsys, damage):
+    scene, out, kore = episode
+    if damage == "swapped":
+        (out / "Hook.wav").write_bytes((out / "Next.wav").read_bytes())
+    else:  # 换了 wav、还没写 timing.json：还没跑过 synth 修
+        lengthen_hook(scene)
+        with monkeypatch.context() as m:
+            crash_at(m, out, "after_wav")
+            with pytest.raises(Crash):
+                main(["synth", str(scene), "--out", str(out), "--only", "Hook"])
+    before = timing(out)
+
+    def transcriber(*args, **kwargs):
+        raise AssertionError("不该听写对不上的段")
+
+    monkeypatch.setitem(align.TRANSCRIBERS, "mlx", transcriber)
+    capsys.readouterr()
+    assert main(["align", str(scene), "--audio", str(out), "--backend", "mlx", "--only", "Hook"]) == 1
+    assert "错误：Hook：" in capsys.readouterr().err and timing(out) == before
+    assert "Hook" not in timing_report.build(script.beats(load_file(scene)), out)["beats"]
 
 
 def test_unchanged_audio_with_another_voice_is_republished_with_its_provenance(tmp_path, monkeypatch):

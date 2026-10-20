@@ -13,6 +13,8 @@ synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读�
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
 review 把成片（可带场景稿和 timing）交给 Gemini 看画面和声音，写出 JSON 报告和一份短 Markdown。退出码：0 通过，1 未通过，2 用法或调用失败。
+synth / pitch --fix 开头把每段的 wav、timing.json、发布说明对一遍（policy.heal）：上次发布被打断的按说明修好；
+wav 和哪份说明都对不上的段不进时间报告，manifest 记成来源不明，synth 以 1 退出（除非这次重合成了它）；align 拒绝对齐这种段（退出码 1）。
 synth / align / pitch --fix 整个运行独占音频目录（.cache/synth.lock）：另一个在跑就等（打一行 waiting for another synth on …），--no-wait 则直接退出 2。
 --lang en 念英文版（每句的 en，书签写在 en 里；见 scene_spec.localize）。synth / align / pitch 要用同一个 --lang 和音频目录；review 用它读场景稿。
 """
@@ -147,8 +149,7 @@ def synth_command(doc: dict, all_beats: list, beats: list, args) -> int:
     persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
     # 整个运行独占音频目录：句子缓存、wav / timing / 说明、manifest、时间报告都只有这一个 synth 在写
     with _locked(args.out, args):
-        for line in policy.reconcile(args.out):  # 上次在发布途中被打断：按说明把 manifest 修好（见 policy.py）
-            print(f"manifest 按发布说明修正：{line}", file=sys.stderr)
+        _heal(args.out, {b.id for b in beats})  # 上次在发布途中被打断：按说明把 timing.json、说明、manifest 修好
         before = synth.total_cost(log_path)
         for beat in beats:
             # 换 wav 之前先在 manifest 里把这一段记成 pending（不合规），发布完再提交实际来源
@@ -160,12 +161,33 @@ def synth_command(doc: dict, all_beats: list, beats: list, args) -> int:
         after = synth.total_cost(log_path)
         done = [b.id for b in beats if (args.out / f"{b.id}.timing.json").exists()]
         conflicts = policy.write_manifest(args.out, choice, args.lang, done)  # 提醒按最终状态给
-        report = timing_report.write(all_beats, args.out)
+        report = timing_report.write(all_beats, args.out)  # 对不上 wav 的 beat 不收（见 timing_report.py）
+        broken = policy.broken_beats(args.out)
     for conflict in conflicts:
         print(f"WARNING: {args.out}：{conflict}", file=sys.stderr)
     print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
     print(f"模型 {choice.model}，声音 {choice.voice}，语速 {choice.speed:g}；时间报告 {report}")
+    if broken:
+        print(f"错误：{args.out} 里这些 beat 的音频和 timing.json / 发布说明对不上，没写进时间报告：{'、'.join(broken)}。"
+              f"请重合成：animind-voice synth {args.spec} --out {args.out} --only {' '.join(broken)}", file=sys.stderr)
+        return 1
     return 0
+
+
+def _heal(audio_dir: Path, redo: set[str]) -> dict[str, str]:
+    """运行开头核对每段的 wav、timing.json、说明（policy.heal），打印修了什么；返回修不好的 beat。redo 是这次会重合成的。"""
+    repaired, changed, broken = policy.heal(audio_dir)
+    for line in repaired:
+        print(f"按发布说明修复：{line}", file=sys.stderr)
+    for line in changed:
+        print(f"manifest 按发布说明修正：{line}", file=sys.stderr)
+    for beat_id, problem in broken.items():
+        if beat_id in redo:
+            print(f"提示：{beat_id}：{problem}；这次会重合成它", file=sys.stderr)
+        else:
+            print(f"错误：{beat_id}：{problem}。manifest 记成来源不明，时间报告不收它；"
+                  f"请重合成这一段（synth --only {beat_id}）", file=sys.stderr)
+    return broken
 
 
 def align_command(doc: dict, beats: list, args) -> int:
@@ -178,15 +200,20 @@ def align_command(doc: dict, beats: list, args) -> int:
     model = args.model or align.DEFAULT_MODELS[backend]
     print(f"对齐后端 {backend}，模型 {model}")
     refs = trace.scene_refs(doc, args.spec, args.lang)
-    flagged = 0
+    flagged, refused = 0, []
     with _locked(args.audio, args):  # align 把书签时刻写回 timing.json：不能和 synth 同时改
         for beat in beats:
-            results = align.align_beat(beat, args.audio, model, align.TRANSCRIBERS[backend])
+            try:
+                results = align.align_beat(beat, args.audio, model, align.TRANSCRIBERS[backend])
+            except align.Inconsistent as exc:  # wav / timing / 说明对不上：不对齐这一段，其他段照做
+                print(f"错误：{exc}", file=sys.stderr)
+                refused.append(beat.id)
+                continue
             flagged += sum(r.flagged for r in results)
             for line in align.warnings(results, refs, beat.id):
                 print(f"  ⚠ {line}")
-    print(f"完成；需要回听 {flagged} 句")
-    return 0
+    print(f"完成；需要回听 {flagged} 句" + (f"；没有对齐 {'、'.join(refused)}" if refused else ""))
+    return 1 if refused else 0
 
 
 def review_command(args) -> int:
@@ -232,11 +259,17 @@ def _review_out(video: Path, out: Path | None) -> Path:
 def pitch_command(doc: dict, beats: list, args) -> int:
     if args.fix:  # 要重合成、重拼：整个过程独占音频目录（测音高也在锁里，看到的是一致的一组）
         with _locked(args.audio, args):
-            policy.reconcile(args.audio)
+            _heal(args.audio, set())
             try:
-                return _pitch(doc, beats, args)
+                code = _pitch(doc, beats, args)
             finally:  # 重拼的段按说明提交来源（和当初一样的 model / voice / speed）
                 policy.reconcile(args.audio)
+            broken = policy.broken_beats(args.audio)
+        if broken:
+            print(f"错误：{args.audio} 里这些 beat 的音频和 timing.json / 发布说明对不上：{'、'.join(broken)}。"
+                  f"请用 synth --only {' '.join(broken)} 重合成", file=sys.stderr)
+            return code or 1
+        return code
     return _pitch(doc, beats, args)
 
 

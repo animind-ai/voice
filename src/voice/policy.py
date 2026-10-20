@@ -118,10 +118,15 @@ UNKNOWN = {"model": None, "voice": None, "speed": None, "policy_ok": False, "unk
 #    写 .cache/beats/<beat>.json（同样带 sha256 和来源）；
 # 3. 最后把实际的 model / voice / speed 提交进 manifest。
 #
-# 每次运行开头 reconcile：目录里每段音频，用 sha256 和现在的 wav 对得上的那份说明（beats/ 优先，其次 beats-next/）
-# 纠正 manifest 的记录；记录是 pending / unknown、或者说明和 wav 对不上，又没有能对上的说明，就记成来源不明。
-# 所以在任何一步被打断，manifest 都不会把不合规的音频说成合规；下一次运行（哪怕只合成别的 beat）会把记录修好。
-# 没有任何说明的旧目录（加缓存之前合成的）保留原来的记录。
+# 每次运行开头（heal）把每段有音频的 beat 的 wav、timing.json、两份说明合起来核对（check_beat）：
+# - repair：找 sha256 和现在的 wav 对得上的那份说明（cues 和 timing.json 一致的优先，其次 beats/、beats-next/）。
+#   timing.json 的 cues / total 和它不一样（换了 wav、还没写 timing.json 就断了）就按说明原子地重写 timing.json，
+#   清掉对齐结果；说明还在 beats-next 就提交到 beats/。
+# - reconcile：按这份说明纠正 manifest 的记录；记录是 pending / unknown、或者没有能对上 wav 的说明，就记成来源不明。
+# 没有说明能对上 wav（手动换过 wav、说明坏了）就修不好：manifest 记成来源不明，时间报告不收它（timing_report），
+# align 拒绝对齐，synth 报错并以非零退出，直到这一段被重合成。
+# 所以在任何一步被打断，manifest 都不会把不合规的音频说成合规，时间报告也不会发布和 wav 对不上的 cues；
+# 下一次运行（哪怕只合成别的 beat）会把能修的修好。没有任何说明的旧目录（加缓存之前合成的）保留原来的记录。
 
 
 def _read(out_dir: Path) -> dict:
@@ -219,17 +224,107 @@ def _stamp(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def stamp_provenance(out_dir: Path, beat_id: str) -> tuple[str, dict | None]:
-    """这一段现在的 wav 是谁念的：("match", 来源)、("mismatch", None)（有说明但都对不上 wav）或 ("none", None)（没有说明）。"""
-    stamps = [s for s in (_stamp(beats_dir(out_dir) / f"{beat_id}.json"), _stamp(next_dir(out_dir) / f"{beat_id}.json")) if s]
-    wav = out_dir / f"{beat_id}.wav"
-    if not stamps:
-        return "none", None
-    digest = sha256_file(wav) if wav.exists() else None
-    for stamp in stamps:
-        if digest is not None and stamp.get("wav_sha256") == digest and all(k in stamp for k in PARTS):
-            return "match", {k: stamp[k] for k in PARTS}
-    return "mismatch", None
+@dataclass(frozen=True)
+class BeatCheck:
+    """一段的 wav、timing.json 和两份说明（beats/、beats-next/）合起来看是不是一致的一套（check_beat）。"""
+    problem: str = ""  # 非空：修不好（wav 和哪份说明都对不上、没有 wav……），只能重合成这一段
+    stamp: dict | None = None  # sha256 和 wav 对得上的说明；None 且没有 problem：没有说明的旧目录，无从核对
+    from_next: bool = False  # 对得上的说明还在 beats-next（发布被打断，没提交）
+    timing_ok: bool = True  # timing.json 的 cues / total 和这份说明一致
+    stale_next: bool = False  # beats-next 里还有一份对不上 wav 的预写说明（换 wav 之前被打断）
+
+    @property
+    def publishable(self) -> bool:
+        """timing.json 的 cues 就是这个 wav 的：能写进时间报告。"""
+        return not self.problem and self.timing_ok
+
+    @property
+    def clean(self) -> bool:
+        """什么都不用修：能对齐。"""
+        return self.publishable and not self.from_next and not self.stale_next
+
+    def describe(self) -> str:
+        if self.problem:
+            return self.problem
+        if not self.timing_ok:
+            return "timing.json 的 cues / total 和 wav 对不上（上次发布被打断）"
+        return "发布说明还没提交（上次发布被打断）"
+
+
+def _timing(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _usable(stamp: dict | None, digest: str) -> bool:
+    """说明记的就是这个 wav，而且带着恢复 timing.json 和来源要用的字段。"""
+    return (stamp is not None and stamp.get("wav_sha256") == digest and all(k in stamp for k in PARTS)
+            and isinstance(stamp.get("cues"), list) and isinstance(stamp.get("total"), (int, float)))
+
+
+def check_beat(out_dir: Path, beat_id: str) -> BeatCheck:
+    """wav、timing.json、说明三样一起核对（见上面的说明）。"""
+    wav, timing_path = out_dir / f"{beat_id}.wav", out_dir / f"{beat_id}.timing.json"
+    committed = _stamp(beats_dir(out_dir) / f"{beat_id}.json")
+    pending = _stamp(next_dir(out_dir) / f"{beat_id}.json")
+    if not wav.exists():
+        return BeatCheck(problem=f"有 {timing_path.name}、没有 {wav.name}" if timing_path.exists()
+                         else f"还没有合成（没有 {wav.name} 和 {timing_path.name}）")
+    if committed is None and pending is None:
+        return BeatCheck()  # 加缓存之前合成的：没有说明，保持原样
+    digest = sha256_file(wav)
+    candidates = [(s, is_next) for s, is_next in ((committed, False), (pending, True)) if _usable(s, digest)]
+    if not candidates:
+        return BeatCheck(problem=f"{wav.name} 和发布说明都对不上（被手动换过，或者说明坏了），不知道它的 cues 和来源")
+    timing = _timing(timing_path)
+
+    def in_sync(stamp: dict) -> bool:
+        return timing is not None and timing.get("cues") == stamp["cues"] and timing.get("total") == stamp["total"]
+
+    stamp, is_next = next((c for c in candidates if in_sync(c[0])), candidates[0])
+    return BeatCheck(stamp=stamp, from_next=is_next, timing_ok=in_sync(stamp), stale_next=pending is not None and not is_next)
+
+
+def repair(out_dir: Path) -> tuple[list[str], dict[str, str]]:
+    """按和 wav 对得上的说明把 timing.json 和说明修好，返回 (修了什么, {修不好的 beat: 原因})。
+
+    timing.json 和说明不一致：按说明原子地重写成只有 cues / total（对齐结果是旧音频的，清掉）；
+    对得上的说明还在 beats-next：提交到 beats/；beats-next 里对不上 wav 的预写说明删掉。manifest 由 reconcile 修。
+    """
+    repaired, broken = [], {}
+    if not out_dir.is_dir():
+        return repaired, broken
+    for beat_id in sorted(_present(out_dir)):
+        check = check_beat(out_dir, beat_id)
+        if check.problem:
+            broken[beat_id] = check.problem
+            continue
+        if check.stamp is None or check.clean:
+            continue
+        notes = []
+        if not check.timing_ok:
+            timing = {"cues": check.stamp["cues"], "total": check.stamp["total"]}
+            write_text_atomic(out_dir / f"{beat_id}.timing.json", json.dumps(timing, ensure_ascii=False, indent=1))
+            notes.append(f"timing.json 按发布说明恢复成 {len(timing['cues'])} 句、{timing['total']:.1f}s，"
+                         "清掉过期的对齐结果（要重新 align）")
+        if check.from_next:
+            write_text_atomic(beats_dir(out_dir) / f"{beat_id}.json", json.dumps(check.stamp))
+            notes.append("提交了被打断的发布说明")
+        (next_dir(out_dir) / f"{beat_id}.json").unlink(missing_ok=True)
+        if notes:
+            repaired.append(f"{beat_id}: {'；'.join(notes)}")
+    return repaired, broken
+
+
+def broken_beats(out_dir: Path) -> dict[str, str]:
+    """目录里有音频、但 timing.json 不能当作这个 wav 的 cues 的 beat → 原因。"""
+    if not out_dir.is_dir():
+        return {}
+    checks = {beat_id: check_beat(out_dir, beat_id) for beat_id in sorted(_present(out_dir))}
+    return {beat_id: check.describe() for beat_id, check in checks.items() if not check.publishable}
 
 
 def reconcile(out_dir: Path) -> list[str]:
@@ -241,10 +336,10 @@ def reconcile(out_dir: Path) -> list[str]:
     changed = []
     for beat_id in sorted(_present(out_dir)):
         record = records.get(beat_id)
-        status, source = stamp_provenance(out_dir, beat_id)
-        if status == "match":
-            fixed = _record(source["model"], source["voice"], source["speed"])
-        elif status == "mismatch" or record is None or record.get("unknown") or record.get("pending"):
+        check = check_beat(out_dir, beat_id)
+        if check.stamp is not None:
+            fixed = _record(check.stamp["model"], check.stamp["voice"], check.stamp["speed"])
+        elif check.problem or record is None or record.get("unknown") or record.get("pending"):
             fixed = dict(UNKNOWN)
         else:
             continue  # 没有说明的旧目录：保留原来的记录
@@ -254,3 +349,9 @@ def reconcile(out_dir: Path) -> list[str]:
     if changed:
         _store(out_dir, records, old.get("lang"), old.get("sources"))
     return changed
+
+
+def heal(out_dir: Path) -> tuple[list[str], list[str], dict[str, str]]:
+    """每次 synth / pitch --fix 开头：先 repair，再 reconcile。返回 (修了的文件, 修了的 manifest 记录, 修不好的 beat)。"""
+    repaired, broken = repair(out_dir)
+    return repaired, reconcile(out_dir), broken
