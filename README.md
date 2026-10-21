@@ -12,6 +12,8 @@
 pip install "animind-voice @ git+https://github.com/animind-ai/voice@v0.1.0"
 ```
 
+用 uv 安装时加 `--no-sources`，例如 `uv pip install --no-sources "…"`；不加的话 uv 会去找开发用的同级目录，装不上。
+
 scene-spec 和 zh-math-reading 会按对应的 tag 一起装上（这几个包还没有发布到 PyPI）。对齐和审片要加 extra，例如 `"animind-voice[align] @ git+..."`（macOS）、`[align-cuda]`、`[review]`、`[vertex]`。
 
 要改代码时，把依赖的几个仓库和本仓库并排检出到同一个目录，再 `uv sync`（见「开发」）。
@@ -173,6 +175,8 @@ The narration pipeline for [scene-spec](https://github.com/animind-ai/scene-spec
 ```bash
 pip install "animind-voice @ git+https://github.com/animind-ai/voice@v0.1.0"
 ```
+
+With uv, add `--no-sources`, e.g. `uv pip install --no-sources "…"`; without it uv looks for the sibling directories used in development and fails.
 
 scene-spec and zh-math-reading are installed from their matching tags (these packages are not on PyPI yet). Alignment and review need extras, e.g. `"animind-voice[align] @ git+..."` (macOS), `[align-cuda]`, `[review]`, `[vertex]`. 
 
