@@ -9,8 +9,8 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
   "numpy>=1.26",
   "PyYAML>=6.0",  # trace.py 用 yaml.compose 取场景文件的行号
-  "scene-spec",
-  "zh-math-reading",
+  "scene-spec @ git+https://github.com/animind-ai/scene-spec@v0.1.0",
+  "zh-math-reading @ git+https://github.com/animind-ai/zh-math-reading@v0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +32,10 @@ dev = ["pytest>=8"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# 同级仓库按 git tag 依赖（未发布到 PyPI）；本地开发仍走 [tool.uv.sources] 的相对路径
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/voice"]

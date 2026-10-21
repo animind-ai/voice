@@ -6,6 +6,16 @@
 
 [scene-spec](https://github.com/animind-ai/scene-spec) 的旁白流水线：读场景文件里的 `say`，逐句合成旁白，再用 Whisper 求出每个书签 `{@名字}` 的真实时刻，顺带检查 TTS 有没有漏念、多念。输出直接给 [kit](https://github.com/animind-ai/kit) 渲染用。成片出来之后，`review` 把视频交给 Gemini 看画面和声音，写出可以当门槛用的审片报告。
 
+### 安装
+
+```bash
+pip install "animind-voice @ git+https://github.com/animind-ai/voice@v0.1.0"
+```
+
+scene-spec 和 zh-math-reading 会按对应的 tag 一起装上（这几个包还没有发布到 PyPI）。对齐和审片要加 extra，例如 `"animind-voice[align] @ git+..."`（macOS）、`[align-cuda]`、`[review]`、`[vertex]`。
+
+要改代码时，把依赖的几个仓库和本仓库并排检出到同一个目录，再 `uv sync`（见「开发」）。
+
 ### 命令
 
 ```bash
@@ -157,6 +167,16 @@ ruff check .
 ## English
 
 The narration pipeline for [scene-spec](https://github.com/animind-ai/scene-spec): reads the `say` lines in a scene file, synthesizes narration sentence by sentence, then uses Whisper to find the real time of every bookmark `{@name}`, checking along the way whether the TTS skipped or added words. The output goes straight to [kit](https://github.com/animind-ai/kit) for rendering. Once the finished video exists, `review` hands it to Gemini to watch the picture and listen to the sound, and writes a review report that can be used as a gate.
+
+### Installation
+
+```bash
+pip install "animind-voice @ git+https://github.com/animind-ai/voice@v0.1.0"
+```
+
+scene-spec and zh-math-reading are installed from their matching tags (these packages are not on PyPI yet). Alignment and review need extras, e.g. `"animind-voice[align] @ git+..."` (macOS), `[align-cuda]`, `[review]`, `[vertex]`. 
+
+To work on the code, check out the repositories it depends on next to this one in the same directory and run `uv sync` (see "Development").
 
 ### Commands
 
