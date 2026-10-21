@@ -1,0 +1,323 @@
+"""Whisper 听写结果的读法归一化：把 1/2、2分之1、x²、25%、-3、+3 这类阿拉伯数字和符号写法，展开成和稿子 `$...$` 公式一样的读法。
+
+稿子经 zh-math-reading 朗读后是“二分之一”“x 的平方”“负三”“正三”，Whisper 却常把念出来的数学听写回数字和记号。
+两边逐字比对就成了大段 replace，落在里面的书签只能线性插值。这里分三层：
+
+1. 读法：每个数学表达式（如 “-25%”、“x+1/2”、“a^-2”）先换成等价的 LaTeX，再交给 zh_math_reading.normalize 读，
+   和稿子里 `$...$` 的读法逐字相同；一元的正负号和二元的加减由 LaTeX 的上下文决定。
+2. 数字：裸数字（如 “10”、“+3”）有两种读法（中文读法，或阿拉伯数字原样）。整句做一次格子上的对齐动态规划，
+   同时决定每个数字用哪种读法，使整句与稿子的读法匹配最多；不是逐个贪心地定。
+3. 时间：表达式的每个读法字先归到一个听写词：和原字逐字相同的字母或数字（锚点，如 “x”）归它所在的词；
+   插入的读法字（的平方、等于、分之、负）归它们来源的原字（如 “²”、“=”）所在的词：来源跨几个词时，在每个词的末尾试读
+   “单元开头到这个词为止”的原字，它正好是读法的开头时就在那里切开（“x²” “+” “y”：的平方归 “x²”，加归 “+”）；
+   切不开的（分数、百分数这类把后面的字提前读的写法）按原字数的比例分。
+   每个词在表达式里的时间段平均分给归它的读法字：单独成词的字母（“x” + “²”）保留它自己的词的时间段，
+   一个词里的整个式子（“a=b”）则逐字平分；连着几个没有锚点的词（如 “1” “/” “2”、“25” “%”）合成一段平分。
+   零时长的段（如零时长的 “+”）把自己的读法字并入相邻的有时长的段（优先后一段）；两边都没有时长才丢掉它自己的字。
+   一个词跨几个单元时，词的时间段按每个内容字的展开字数比例分（所以 “看1/2好” 中的 “好” 从 5/6 秒开始）。
+
+表达式的边界（唯一的规则，expand 和 chars_from_words 共用）：相邻两个词里的字，只有两边都是字母或数字时才不连成一个表达式；
+时间的长短不影响表达式的语义。
+"""
+
+from __future__ import annotations
+
+import difflib
+import re
+
+from zh_math_reading import normalize
+
+from . import textalign
+from .textalign import HeardChar
+
+_SUP = {"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9"}
+_BARE = re.compile(r"[+-]?\d+(?:\.\d+)?")  # 只有一个数（可带正负号）：有两种读法
+_CNFRAC = re.compile(r"(\d+)分之(\d+)")  # “2分之1”：分母在前
+# 数学表达式：一串数学字符；前面可以是“数分之数”
+_RUN = re.compile(r"\d+分之\d+|[A-Za-z0-9.+\-*/=×÷%²³⁴⁵⁶⁷⁸⁹⁰¹^√]+")
+_OPERAND = r"(?:[A-Za-z]|\d+(?:\.\d+)?)"
+# 单独的运算符（两边是别的词）是二元的：读法同 “a+b” 里的运算符。zh_math_reading 对单独的 “+” 读作“正”（一元），这里不用。
+_BINARY_OP = {"+": "加", "-": "减", "=": "等于", "×": "乘", "*": "乘", "÷": "除以", "≤": "小于等于", "≥": "大于等于"}
+
+Option = tuple[str, ...]  # 一个单元的读法选项；单元有 1 个选项（固定读法）或 2 个（裸数字）
+
+
+def _latex(run: str) -> str:
+    """把 Whisper 写的数学表达式换成等价的 LaTeX（和稿子里 $...$ 的写法一样），供 zh_math_reading 读。"""
+    t = re.sub(rf"({_OPERAND})([{''.join(_SUP)}]+)",
+               lambda m: m.group(1) + "^{" + "".join(_SUP[c] for c in m.group(2)) + "}", run)
+    t = re.sub(r"\^(-?\d+)", r"^{\1}", t)  # 记号写法：x^2、a^-2
+    t = re.sub(rf"(?<![\w^{{])([+-]?)({_OPERAND})/({_OPERAND})", r"\1\\frac{\2}{\3}", t)  # 1/2、-1/2、x+1/2
+    t = re.sub(r"(\d+(?:\.\d+)?)%", r"\1\\%", t)
+    t = re.sub(r"√\s*(\d+(?:\.\d+)?|[A-Za-z])", r"\\sqrt{\1}", t)
+    return t.replace("×", r"\times").replace("*", r"\times").replace("÷", r"\div").replace("≤", r"\le").replace("≥", r"\ge")
+
+
+def _math_options(run: str) -> tuple[str, ...] | None:
+    """一个数学表达式的读法选项；不是式子（只有符号）时返回 None。"""
+    m = _CNFRAC.fullmatch(run)
+    if m:
+        return (normalize(rf"${{\frac{{{m.group(2)}}}{{{m.group(1)}}}}}$"),)
+    if _BARE.fullmatch(run):
+        return (normalize(f"${run}$"), run)  # 中文读法在前（平手时用它）
+    if not re.search(r"[A-Za-z0-9]", run):
+        return (_BINARY_OP[run],) if run in _BINARY_OP else None
+    return (normalize(f"${_latex(run)}$"),)
+
+
+def _wordlike(ch: str) -> bool:
+    """字母、汉字、数字（不含上标数字）。相邻两个词的这两个字都是它时，表达式不能跨过这个边界。"""
+    return ch.isalnum() and ch not in _SUP
+
+
+def _chars(words: list[dict]) -> list[tuple[str, int]]:
+    return [(c, wi) for wi, w in enumerate(words) for c in w["word"] if not c.isspace()]
+
+
+def _blocks(chars: list[tuple[str, int]]) -> list[tuple[int, int]]:
+    cuts = [0]
+    for i in range(1, len(chars)):
+        if chars[i][1] != chars[i - 1][1] and _wordlike(chars[i - 1][0]) and _wordlike(chars[i][0]):
+            cuts.append(i)
+    cuts.append(len(chars))
+    return list(zip(cuts, cuts[1:]))
+
+
+def _units(chars: list[tuple[str, int]]) -> list[tuple[int, int, Option]]:
+    """切成单元 (起, 止, 读法选项)。数学表达式、裸数字是一个单元；其余每个字一个单元。"""
+    text = "".join(ch for ch, _ in chars)
+    units: list[tuple[int, int, Option]] = []
+    for lo, hi in _blocks(chars):
+        seg, pos = text[lo:hi], 0
+        for m in _RUN.finditer(seg):
+            units += [(lo + i, lo + i + 1, (seg[i],)) for i in range(pos, m.start())]
+            try:
+                opts = _math_options(m.group(0))
+            except Exception:  # 读不了的写法（如不完整的式子）按字拆开
+                opts = None
+            if opts is None:
+                units += [(lo + i, lo + i + 1, (seg[i],)) for i in range(m.start(), m.end())]
+            else:
+                units.append((lo + m.start(), lo + m.end(), opts))
+            pos = m.end()
+        units += [(lo + i, lo + i + 1, (seg[i],)) for i in range(pos, len(seg))]
+    return units
+
+
+def _choose(units: list[tuple[int, int, Option]], script: str) -> list[int]:
+    """整句的格子动态规划：每个单元选一个读法，使整句的读法与稿子的读法（归一化后的内容字）的匹配字数最多。
+
+    状态是（单元边界，稿子位置），沿着每个选项的字走：字相同就匹配（+1），不同就跳过听写的字，稿子的字也可以跳过。
+    平手时选靠前的选项（中文读法）。
+    """
+    target = [textalign.normalize(c) for c in script if textalign.is_content(c)]
+    n_target = len(target)
+    neg = float("-inf")
+
+    def skip(arr):  # 稿子的字可以不被听写：同一层里向后传递
+        for q in range(n_target):
+            if arr[q][0] > arr[q + 1][0]:
+                arr[q + 1] = (arr[q][0], "s")
+        return arr
+
+    junctions = [skip([(0.0, "start")] + [(neg, None)] * n_target)]
+    chains: list[list[list]] = []
+    for _, _, opts in units:
+        per_option = []
+        for opt in opts:
+            heard = [textalign.normalize(c) for c in opt if textalign.is_content(c)]
+            layers = [junctions[-1]]
+            for ch in heard:
+                prev, new = layers[-1], [(neg, None)] * (n_target + 1)
+                for q in range(n_target + 1):
+                    s = prev[q][0]
+                    if s == neg:
+                        continue
+                    if s > new[q][0]:
+                        new[q] = (s, "h")  # 听写的字没有对上稿子
+                    if q < n_target and target[q] == ch and s + 1 > new[q + 1][0]:
+                        new[q + 1] = (s + 1, "m")  # 对上了
+                layers.append(skip(new))
+            per_option.append(layers)
+        new = [(neg, None)] * (n_target + 1)
+        for oi, layers in enumerate(per_option):
+            for q, (s, _) in enumerate(layers[-1]):
+                if s > new[q][0]:
+                    new[q] = (s, ("opt", oi))
+        junctions.append(skip(new))
+        chains.append(per_option)
+
+    choice = [0] * len(units)
+    k = len(units)
+    q = max(range(n_target + 1), key=lambda j: junctions[k][j][0])
+    while k > 0:
+        kind = junctions[k][q][1]
+        while kind == "s":
+            q -= 1
+            kind = junctions[k][q][1]
+        oi = kind[1]
+        choice[k - 1] = oi
+        layers = chains[k - 1][oi]
+        layer = len(layers) - 1
+        while layer > 0:
+            kind = layers[layer][q][1]
+            if kind == "s":
+                q -= 1
+            elif kind == "h":
+                layer -= 1
+            else:  # "m"
+                layer -= 1
+                q -= 1
+        k -= 1
+    return choice
+
+
+def _intervals(words: list[dict], chars, units, choice) -> list[tuple[float, float]]:
+    """每个字的时间段。权重 = 它所在单元的展开内容字数 ÷ 单元里的内容字数，词的时间段按权重分给它的内容字。"""
+    weight = [0.0] * len(chars)
+    for (a, b, opts), c in zip(units, choice):
+        raw = [i for i in range(a, b) if textalign.is_content(chars[i][0])]
+        if raw:
+            expanded = sum(1 for ch in opts[c] if textalign.is_content(ch))
+            for i in raw:
+                weight[i] = expanded / len(raw)
+    out: list[tuple[float, float]] = [(0.0, 0.0)] * len(chars)
+    pos = 0
+    for w in words:
+        idxs = list(range(pos, pos + sum(1 for c in w["word"] if not c.isspace())))
+        pos += len(idxs)
+        if not idxs:
+            continue
+        s, e = w["start"], w["end"]
+        content = [i for i in idxs if textalign.is_content(chars[i][0])]
+        if not content:  # 只有符号的词（如单独的 “%”）：整段时间给它的每个字
+            for i in idxs:
+                out[i] = (s, e)
+            continue
+        total = sum(weight[i] for i in content)
+        cum, prev_end = 0.0, s
+        for i in idxs:
+            if textalign.is_content(chars[i][0]):
+                lo = s + (e - s) * cum / total if total > 0 else s
+                cum += weight[i]
+                hi = s + (e - s) * cum / total if total > 0 else s
+                out[i] = (lo, hi)
+                prev_end = hi
+            else:
+                out[i] = (prev_end, prev_end)
+    return out
+
+
+def _prefix_len(chars, a: int, p: int, reading_chars: list[str]) -> int | None:
+    """单元里原字 a..p（到某个词的末尾）单独读出来的内容字数；它不是整个单元读法的开头（如分数、百分数会把后面的字提前）时返回 None。"""
+    try:
+        head = [ch for ch in normalize(f"${_latex(''.join(ch for ch, _ in chars[a:p]))}$") if textalign.is_content(ch)]
+    except Exception:
+        return None
+    return len(head) if head == reading_chars[:len(head)] else None
+
+
+def _emit(units, choice, chars, ivs) -> list[HeardChar]:
+    """每个单元的读法字分给听写词（规则见模块说明第 3 条），每个词（或连着的没有锚点的几个词）的时间段平均分给它的读法字。"""
+    out: list[HeardChar] = []
+    for (a, b, opts), c in zip(units, choice):
+        reading_chars = [ch for ch in opts[c] if textalign.is_content(ch)]
+        n = len(reading_chars)
+        if not n:
+            continue
+        cand = [i for i in range(a, b) if _wordlike(chars[i][0])]
+        matcher = difflib.SequenceMatcher(None, [chars[i][0] for i in cand], reading_chars, autojunk=False)
+        anchor: dict[int, int] = {}  # 读法里的第几个字 → 原字的序号
+        for blk in matcher.get_matching_blocks():
+            for k in range(blk.size):
+                anchor[blk.b + k] = cand[blk.a + k]
+        owner = [chars[anchor[r]][1] if r in anchor else -1 for r in range(n)]  # 每个读法字归哪个词
+        r = 0
+        while r < n:
+            if r in anchor:
+                r += 1
+                continue
+            g0 = r
+            while r < n and r not in anchor:
+                r += 1
+            # 这段插入的字来自前后两个锚点之间的原字。跨几个词时，先在每个词的末尾切开：单元开头到这个词为止的原字单独读出来，
+            # 正好是读法的开头 L 个字，那前 L 个字就属于这个词及之前的词（“x²” “+” “y”：的平方归 “x²”，加归 “+”）。
+            # 切不开的部分（分数、百分数这类把后面的字提前读的写法）按原字数的比例分。
+            s_lo, s_hi = anchor[g0 - 1] + 1 if g0 > 0 else a, anchor[r] if r < n else b
+            cuts = [(g0, s_lo)]
+            for p in range(s_lo + 1, s_hi):
+                if chars[p][1] != chars[p - 1][1]:
+                    cut = _prefix_len(chars, a, p, reading_chars)
+                    if cut is not None and cuts[-1][0] <= cut <= r:
+                        cuts.append((cut, p))
+            cuts.append((r, s_hi))
+            for (r0, p0), (r1, p1) in zip(cuts, cuts[1:]):
+                src = [chars[i][1] for i in range(p0, p1)]
+                src = src or [owner[g0 - 1] if g0 > 0 else owner[r]]
+                for k in range(r1 - r0):
+                    owner[r0 + k] = src[int((k + 0.5) * len(src) / (r1 - r0))]
+        anchored = {chars[i][1] for i in anchor.values()}
+        chunk: dict[int, int] = {}  # 词 → 段：有锚点的词各自一段，连着的没有锚点的词合成一段
+        for wi in dict.fromkeys(chars[i][1] for i in range(a, b)):
+            prev = next(reversed(chunk), None)
+            merge = prev is not None and prev not in anchored and wi not in anchored
+            chunk[wi] = chunk[prev] if merge else len(set(chunk.values()))
+        groups = list(dict.fromkeys(chunk.values()))
+        spans = {}
+        for g in groups:
+            span = [ivs[i] for i in range(a, b) if chunk[chars[i][1]] == g]
+            spans[g] = (min(s for s, _ in span), max(e for _, e in span))
+        mine = {g: [reading_chars[r] for r in range(n) if chunk[owner[r]] == g] for g in groups}
+        # 零时长的段（如零时长的 “+”）：它自己的读法字并入相邻的有时长的段（优先后一段，“加”在 “y” 前面），时间仍然单调；
+        # 两边都没有时长时只丢掉它自己的字。
+        for k, g in enumerate(groups):
+            lo, hi = spans[g]
+            if hi > lo or not mine[g]:
+                continue
+            near = [(groups[k + 1], True)] if k + 1 < len(groups) else []
+            near += [(groups[k - 1], False)] if k > 0 else []
+            for h, after in near:
+                h_lo, h_hi = spans[h]
+                if h_hi > h_lo:
+                    mine[h] = mine[g] + mine[h] if after else mine[h] + mine[g]
+                    spans[h] = (min(h_lo, lo), h_hi) if after else (h_lo, max(h_hi, hi))
+                    break
+            mine[g] = []
+        for g in groups:
+            lo, hi = spans[g]
+            if hi > lo and mine[g]:
+                out += [HeardChar(ch, lo + (hi - lo) * k / len(mine[g]), lo + (hi - lo) * (k + 1) / len(mine[g]))
+                        for k, ch in enumerate(mine[g])]
+    return out
+
+
+def _resolve(words: list[dict], script: str):
+    chars = _chars(words)
+    units = _units(chars)
+    choice = _choose(units, script)
+    return chars, units, choice
+
+
+def expand_words(words: list[dict], lang: str = "zh", script: str = "") -> str:
+    """听写词展开成读法文本（和稿子的读法比对用）。英文不处理。"""
+    if lang != "zh":
+        return "".join(w["word"] for w in words)
+    _, units, choice = _resolve(words, script)
+    return "".join(opts[c] for (_, _, opts), c in zip(units, choice))
+
+
+def expand(text: str, lang: str = "zh", script: str = "") -> str:
+    """只有文本、没有词时间的版本：空白分开的是不同的词，没有空白的是同一个词。英文原样返回。"""
+    if lang != "zh":
+        return text
+    return expand_words([{"word": tok, "start": 0.0, "end": 0.0} for tok in text.split()], lang, script)
+
+
+def chars_from_words(words: list[dict], lang: str = "zh", script: str = "") -> list[HeardChar]:
+    """Whisper 的词摊成逐字，每个字带时间段（规则见模块说明）。零时长的字借不到时间，不输出（书签插值，不误标为 matched）。"""
+    if lang != "zh":
+        return textalign.chars_from_words(words)
+    ws = [w for w in words if any(not c.isspace() for c in w["word"])]
+    chars, units, choice = _resolve(ws, script)
+    ivs = _intervals(ws, chars, units, choice)
+    return _emit(units, choice, chars, ivs)

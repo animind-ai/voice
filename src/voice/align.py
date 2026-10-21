@@ -19,9 +19,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import textalign
+from . import heard, policy, textalign
 from .audio import slice_16k
 from .script import Beat, Sentence
+from .ttscache import write_text_atomic
+
+
+class Inconsistent(ValueError):
+    """这一段的 wav、timing.json 和发布说明对不上（policy.check_beat），不能对齐。"""
+
 
 BACKENDS = ("mlx", "faster")
 DEFAULT_MODELS = {
@@ -43,6 +49,9 @@ class SentenceResult:
     confirmed: list[str] | None = None  # 复核后仍然缺的字；None 表示没复核
     words: list[list[float]] = field(default_factory=list)  # [[稿子里第几个字（词首）, 时刻], ...]，只记精确匹配上的
     content: int = 0  # 稿子里参与对齐的字数
+    index: int = 0  # 这句在 beat 的 say 里的下标
+    start: float = 0.0  # 这句在 beat 音频里的起止（timing.json 的 cue）
+    end: float = 0.0
 
     @property
     def suspicious(self) -> bool:
@@ -117,15 +126,37 @@ def transcribe(samples, prompt: str, model: str, language: str = "zh") -> tuple[
     return TRANSCRIBERS[default_backend()](samples, prompt, model, language)
 
 
-def _looks_hallucinated(spoken: str, heard: str) -> bool:
+def _looks_hallucinated(spoken: str, heard_text: str, lang: str = "zh", words: list[dict] | None = None) -> bool:
     """Whisper 的重复死循环或乱码：听写比稿子长很多，或者和稿子几乎对不上。"""
+    heard_text = _heard_text(heard_text, lang, spoken, words)
     a = sum(1 for c in spoken if textalign.is_content(c))
-    b = sum(1 for c in heard if textalign.is_content(c))
+    b = sum(1 for c in heard_text if textalign.is_content(c))
     if b > 1.4 * a + 4:
         return True
-    d = textalign.diff(spoken, heard)
+    d = textalign.diff(spoken, heard_text)
     missing = sum(len(x) for x in d.missing)
     return missing > 0.4 * a
+
+
+def _compare_text(text: str, words: list[dict] | None) -> str:
+    """听写的全文，词与词之间加空格：和逐字时间用的是同一套词边界（heard 里空白分开的就是不同的词）。
+    Whisper 的逐字时间戳有时没覆盖到句尾，全文比时间戳多出来的部分原样接在后面（没有时间，但要算进缺字检查）。"""
+    if not words:
+        return text
+    tokens = [w["word"].strip() for w in words]
+    joined = "".join(tokens)
+    flat = text.replace(" ", "")
+    if not flat.startswith(joined):
+        return text
+    tail = flat[len(joined):]
+    return " ".join(tokens + ([tail] if tail else []))
+
+
+def _heard_text(text: str, lang: str, script: str, words: list[dict] | None = None) -> str:
+    """听写和稿子比对前的归一化：英文把数字拼成单词；中文把数字和记号展开成读法（数字按稿子的读法定）。"""
+    if lang == "en":
+        return textalign.spell_numbers(text)
+    return heard.expand(_compare_text(text, words), lang, script)
 
 
 def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, transcriber,
@@ -136,16 +167,16 @@ def _transcribe_all(wav: Path, s0: float, s1: float, spoken: str, model: str, tr
     """
     samples = slice_16k(wav, s0, s1)
     heard_text, words = transcriber(samples, spoken, model, language)
-    if _looks_hallucinated(spoken, heard_text):
+    if _looks_hallucinated(spoken, heard_text, language, words):
         retry_text, retry_words = transcriber(samples, "", model, language)
-        if textalign.align(spoken, textalign.chars_from_words(retry_words)).ratio > \
-                textalign.align(spoken, textalign.chars_from_words(words)).ratio:
+        if textalign.align(spoken, heard.chars_from_words(retry_words, language, spoken)).ratio > \
+                textalign.align(spoken, heard.chars_from_words(words, language, spoken)).ratio:
             heard_text, words = retry_text, retry_words
     for _ in range(2):
         last = max((w["end"] for w in words), default=0.0)
         if s0 + last >= s1 - 0.6:
             break
-        covered = sum(1 for w in words for ch in w["word"] if textalign.is_content(ch))
+        covered = len(heard.chars_from_words(words, language, spoken))  # 展开之后的字数，和稿子的字数对得上
         rest = spoken[_offset_after(spoken, covered):]
         if not rest.strip():
             break
@@ -174,7 +205,7 @@ def align_sentence(sentence: Sentence, wav: Path, start: float, end: float, mode
     if sentence.lang == "en":  # Whisper 常把念出来的 two 写成 2：先拼回单词再和稿子配对
         heard_text = textalign.spell_numbers(heard_text)
         words = [{**w, "word": textalign.spell_numbers(w["word"])} for w in words]
-    chars = textalign.chars_from_words(words)
+    chars = heard.chars_from_words(words, sentence.lang, sentence.spoken)
     al = textalign.align(sentence.spoken, chars)
     res = SentenceResult(sentence.key, round(al.ratio, 3), heard=heard_text)
     for name, offset in sentence.marks.items():
@@ -191,7 +222,7 @@ def align_sentence(sentence: Sentence, wav: Path, start: float, end: float, mode
         prev = textalign.is_content(ch)
     res.words = [[i, round(s0 + al.heard[al.mapping[i]].start, 3)] for i in starts if i in al.mapping]
     res.content = len(al.script)
-    d = textalign.diff(sentence.spoken, heard_text)
+    d = textalign.diff(sentence.spoken, _heard_text(heard_text, sentence.lang, sentence.spoken, words))
     res.missing, res.extra = d.missing, d.extra
     return res
 
@@ -203,10 +234,10 @@ def confirm(sentence: Sentence, raw_wav: Path, model: str, transcriber=transcrib
     变速让字更难辨认，提示词会把它往稿子上带，也可能带偏。
     """
     samples = slice_16k(raw_wav, 0.0, 600.0)
-    heard_plain, _ = transcriber(samples, "", model, sentence.lang)
-    heard_prompted, _ = transcriber(samples, sentence.spoken, model, sentence.lang)
-    if sentence.lang == "en":
-        heard_plain, heard_prompted = textalign.spell_numbers(heard_plain), textalign.spell_numbers(heard_prompted)
+    heard_plain, words_plain = transcriber(samples, "", model, sentence.lang)
+    heard_prompted, words_prompted = transcriber(samples, sentence.spoken, model, sentence.lang)
+    heard_plain = _heard_text(heard_plain, sentence.lang, sentence.spoken, words_plain)
+    heard_prompted = _heard_text(heard_prompted, sentence.lang, sentence.spoken, words_prompted)
     gone_a = set("".join(textalign.diff(sentence.spoken, heard_plain).missing))
     gone_b = set("".join(textalign.diff(sentence.spoken, heard_prompted).missing))
     both = gone_a & gone_b
@@ -221,6 +252,10 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
         return []
     if not timing_path.exists() or not wav.exists():
         raise FileNotFoundError(f"{beat.id}：缺少 {wav.name} 或 {timing_path.name}，先运行 synth")
+    check = policy.check_beat(audio_dir, beat.id)
+    if not check.clean:  # 按对不上 wav 的 cues 去切音频，书签时刻全是错的
+        raise Inconsistent(f"{beat.id}：{check.describe()}，不对齐。"
+                           f"先运行 synth（能修的会按发布说明修好；修不好的要重合成：synth --only {beat.id}）")
     timing = json.loads(timing_path.read_text(encoding="utf-8"))
     cues = timing["cues"]
     if len(cues) != len(beat.sentences):
@@ -228,6 +263,7 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
     results = []
     for sentence, cue in zip(beat.sentences, cues):
         r = align_sentence(sentence, wav, cue["start"], cue["end"], model, transcriber)
+        r.index, r.start, r.end = sentence.index, cue["start"], cue["end"]
         raw = audio_dir / "lines" / f"{beat.id}-{sentence.index}.wav"
         if r.suspicious and raw.exists():
             r.confirmed = confirm(sentence, raw, model, transcriber)
@@ -236,9 +272,38 @@ def align_beat(beat: Beat, audio_dir: Path, model: str | None = None, transcribe
     timing["check"] = {r.key: {"ratio": r.ratio, "missing": r.missing, "extra": r.extra, "heard": r.heard,
                                "confirmed": r.confirmed} for r in results}
     timing["words"] = {r.key: {"n": r.content, "at": r.words} for r in results if r.words}
+    timing["how"] = {r.key: r.how for r in results if r.how}  # 每个书签：matched / interpolated / estimated
     timing["aligner"] = model
-    timing_path.write_text(json.dumps(timing, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_text_atomic(timing_path, json.dumps(timing, ensure_ascii=False, indent=1))
     flagged = [r.key for r in results if r.flagged]
     est = sum(1 for r in results for h in r.how.values() if h != "matched")
-    log(f"{beat.id}: {len(results)} 句，书签 {sum(len(r.marks) for r in results)} 个（非精确匹配 {est}），需要回听 {flagged or '无'}")
+    log(f"{beat.id}: {len(results)} 句，书签 {sum(len(r.marks) for r in results)} 个（精确匹配率 {match_rate(results):.0%}，非精确匹配 {est}），需要回听 {flagged or '无'}")
     return results
+
+
+def match_rate(results: list[SentenceResult]) -> float:
+    """书签里精确匹配（matched）的比例；没有书签时为 1。"""
+    hows = [h for r in results for h in r.how.values()]
+    return sum(h == "matched" for h in hows) / len(hows) if hows else 1.0
+
+
+def warnings(results: list[SentenceResult], refs: dict | None, beat_id: str) -> list[str]:
+    """要人看的提示，每条带场景文件里的位置：beats[2].say[1] (line 37, t=12.300-15.800)。t 是 beat 音频里的时刻。
+
+    书签不是逐字配上的（interpolated / estimated）各一条；需要回听的句子（漏念、多念、像幻觉）一条。
+    refs 是 trace.scene_refs 的结果；没有就只写 beat 和句子的键。
+    """
+    from .trace import describe
+
+    beat = (refs or {}).get(beat_id)
+    out = []
+    for r in results:
+        ref = next((say for say in beat.says if say.index == r.index), None) if beat else None
+        where = describe(ref, r.start, r.end) if ref else f"{beat_id}[{r.key}] (t={r.start:.3f}-{r.end:.3f})"
+        for name, how in r.how.items():
+            if how != "matched":
+                out.append(f"{where}: 书签 {{@{name}}} {'插值' if how == 'interpolated' else '估算'}（{how}）在 {r.marks[name]:.3f}s，请核对")
+        if r.flagged:
+            sure = f"；复核仍缺 {r.confirmed}" if r.confirmed else "（没有原始单句音频，未复核）"
+            out.append(f"{where}: 匹配 {r.ratio:.0%}；没听到 {r.missing}；多出 {r.extra}{sure}\n    听到：{r.heard}")
+    return out

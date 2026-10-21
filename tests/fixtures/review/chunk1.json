@@ -1,0 +1,35 @@
+{
+  "summary": "接缝附近画面仍晚于旁白，后面黑板上的 A8 写成了 120。",
+  "issues": [
+    {
+      "category": "av_sync",
+      "severity": "major",
+      "start": 0.4,
+      "end": 4.2,
+      "evidence": "这段开头旁白已经在说二阶差，画面还停在一阶。",
+      "suggested_fix": "和上一段对齐二阶差的出现时刻。",
+      "beat": "Method",
+      "sentence": "s2"
+    },
+    {
+      "category": "math",
+      "severity": "blocker",
+      "start": 20,
+      "end": 26,
+      "evidence": "画面写着 A_8=120，口播和稿子都是 121。",
+      "suggested_fix": "把画面上的结果改成 121。",
+      "beat": "Answer",
+      "sentence": "s1"
+    },
+    {
+      "category": "tts_filler",
+      "severity": "minor",
+      "start": 30,
+      "end": 31.2,
+      "evidence": "「别慌」前面多了一个稿子里没有的「嗯」。",
+      "suggested_fix": "重合成这一句，并核对没有语气词。",
+      "beat": "Opening",
+      "sentence": "s3"
+    }
+  ]
+}
