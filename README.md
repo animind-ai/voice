@@ -1,8 +1,12 @@
 # animind-voice
 
+[中文](#中文) | [English](#english)
+
+## 中文
+
 [scene-spec](https://github.com/animind-ai/scene-spec) 的旁白流水线：读场景文件里的 `say`，逐句合成旁白，再用 Whisper 求出每个书签 `{@名字}` 的真实时刻，顺带检查 TTS 有没有漏念、多念。输出直接给 [kit](https://github.com/animind-ai/kit) 渲染用。成片出来之后，`review` 把视频交给 Gemini 看画面和声音，写出可以当门槛用的审片报告。
 
-## 命令
+### 命令
 
 ```bash
 uv sync --extra align        # macOS（Apple 芯片）；Linux + NVIDIA 用 uv sync --extra align-cuda
@@ -27,7 +31,7 @@ Gemini TTS 偶尔会在单句里换成另一个性别的声音（同一个 `voic
 
 `synth` 的模型和声音从 `--env` 文件或环境变量读：`GEMINI_TTS_MODEL`（名字带 `/` 走 OpenRouter，需要 `OPENROUTER_API_KEY`；否则走 Vertex，需要 `uv sync --extra vertex` 和 `GOOGLE_*`）、`GEMINI_TTS_VOICE`。密钥从不打印，也不要放进仓库。人设取场景文件的 `style.voice.persona`，语速取 `style.voice.speed`（atempo 变速，不变调）。
 
-### 句级缓存
+#### 句级缓存
 
 每句的原声缓存在音频目录的 `.cache/` 里：`.cache/tts/<键>.json` 是索引，指向 `.cache/objects/<内容的 sha256>.wav`。键是 sha256(缓存格式版本、模型、声音、人设、语气、语言、送给 TTS 的 instructions、送给 TTS 的正文——也就是 normalize、去掉书签之后的读法文本)。所以改了某一句，只有这一句重新调用 TTS；同一段的其他句子直接读盘，不花钱、不等待，韵律也不变（拼出来的 `<beat>.wav` 里这几句的采样逐字节相同）。日志每段一行，例如 `Hook: 2 cached, 1 synthesized；3 句，9.4s`。
 
@@ -69,7 +73,7 @@ kit 读到 `marks` 就用真实时刻，没有就按字符位置比例估算。
 
 行号指向这句的 `text`（`--lang en` 时是 `en`），从 `yaml.compose` 的节点起点取，scene-spec 不用改。
 
-## 审片
+### 审片
 
 `review` 把一集成片交给 Gemini 的视频理解（默认 `gemini-4-argon`，2026-10 时面向数学和长视频的旗舰模型；`--model` 或环境变量 `GEMINI_REVIEW_MODEL` 可换）。模型要同时看画面和听声音，对照场景稿里的旁白、书签时刻和 align 写下的回听差异（有 `--spec` / `--audio` 才附上）。提示词在 `src/voice/prompts/review/v1/`，换说法就加一个新版本目录，用 `--prompt-version` 指定。
 
@@ -121,7 +125,7 @@ JSON 里给流水线看的是 `gate`，形状和 scene-spec 检查器的 `Report
 
 顶层的 `ok` 和 `gate.ok` 相同。完整字段见 `src/voice/prompts/review/v1/report.schema.json`。
 
-### 追溯到场景文件
+#### 追溯到场景文件
 
 有 `--spec` 时，每条问题按它在整集上的时间 `[start, end]` 对回场景文件，补上 `beat`、`sentence`（句子的 id，没有 id 就是下标）、`line`、`column` 和 `path`，例如 `beats[3].say[1] (line 22, t=15.200-15.400)`：
 
@@ -137,15 +141,167 @@ JSON 里给流水线看的是 `gate`，形状和 scene-spec 检查器的 `Report
   听到：然后告诉我们，数列 A n 是二、五、十一、二十一、三十六，省略，而且，……
 ```
 
-## 开发
+### 开发
 
 ```bash
 uv run pytest      # 不调用 TTS、Whisper 和 Gemini：合成用假的 speak，对齐用假的 transcriber，审片用录好的 JSON
 ruff check .
 ```
 
-## 作者与许可
+### 作者与许可
 
 作者：Boxi Yu（[@BoxiYu](https://github.com/BoxiYu)）
 
 代码以 [MIT 许可](LICENSE)发布。
+
+## English
+
+The narration pipeline for [scene-spec](https://github.com/animind-ai/scene-spec): reads the `say` lines in a scene file, synthesizes narration sentence by sentence, then uses Whisper to find the real time of every bookmark `{@name}`, checking along the way whether the TTS skipped or added words. The output goes straight to [kit](https://github.com/animind-ai/kit) for rendering. Once the finished video exists, `review` hands it to Gemini to watch the picture and listen to the sound, and writes a review report that can be used as a gate.
+
+### Commands
+
+```bash
+uv sync --extra align        # macOS (Apple silicon); on Linux + NVIDIA use uv sync --extra align-cuda
+# 1. Synthesize: one audio clip per sentence (cached in build/audio/.cache/, see "Sentence-level cache"), joined into <beat>.wav + <beat>.timing.json
+uv run animind-voice synth ../scene-spec/examples/s67-p01.scene.yaml --out build/audio --env /path/to/.env
+# 2. Align + listen-back: write bookmarks' real times back into timing.json and list sentences a human should listen to
+uv run animind-voice align ../scene-spec/examples/s67-p01.scene.yaml --audio build/audio
+# 3. Pitch check: find sentences that sound like a different voice; --fix re-synthesizes only those, then re-run align on them
+uv run animind-voice pitch ../scene-spec/examples/s67-p01.scene.yaml --audio build/audio [--fix --env /path/to/.env]
+# 4. Review: watch the whole finished episode (picture + sound). Attach the scene file and timing when available
+uv sync --extra review
+uv run animind-voice review build/s67-p01.mp4 \
+  --spec ../scene-spec/examples/s67-p01.scene.yaml \
+  --audio build/audio \
+  --env /path/to/.env \
+  --out build/review/s67-p01.review.json
+```
+
+Gemini TTS occasionally switches to a voice of the other gender within a single sentence (same `voice`, same model). So persona text doesn't specify gender, and every sentence asks to "keep the same voice throughout"; after synthesis, the sentence's median fundamental frequency is measured and compared against the range expected for that voice (currently Kore, Aoede, Leda, Zephyr are recognized as female voices, with below 150 Hz counted as a switch; Puck, Charon, Fenrir, Orus as male voices, with above 190 Hz counted as a switch). If the voice switched, the sentence is re-synthesized, up to 3 times, each attempt logged; if all 3 fail, the closest take is kept and flagged for listen-back. Other voices are not judged. `pitch` runs the same check on an already-synthesized directory.
+
+English version: add `--lang en` to synth, align and pitch to read each sentence's `en` (bookmarks are written inside `en`; see scene-spec design doc §7.7), using a separate audio directory. Synthesis instructions switch to English and Vertex uses en-US, skipping the Chinese reading rules; during alignment, Whisper transcribes in English, and heard Arabic numerals are first spelled out as words (2 → two) before matching against the script. For `review`, `--lang en` only changes which script is attached for the model.
+
+`synth` reads the model and voice from the `--env` file or environment variables: `GEMINI_TTS_MODEL` (a name containing `/` goes through OpenRouter and needs `OPENROUTER_API_KEY`; otherwise Vertex, which needs `uv sync --extra vertex` and `GOOGLE_*`), and `GEMINI_TTS_VOICE`. Keys are never printed and should never be put in the repository. The persona comes from the scene file's `style.voice.persona`, and the speed from `style.voice.speed` (atempo time-stretching, pitch unchanged).
+
+#### Sentence-level cache
+
+Each sentence's raw audio is cached under `.cache/` in the audio directory: `.cache/tts/<key>.json` is an index entry pointing to `.cache/objects/<sha256 of the content>.wav`. The key is sha256(cache format version, model, voice, persona, tone, language, the instructions sent to TTS, the text sent to TTS — i.e. the reading text after normalize with bookmarks removed). So when you change one sentence, only that sentence calls TTS again; the other sentences in the beat are read from disk, costing no money or time, and their prosody doesn't change (those sentences' samples in the joined `<beat>.wav` are byte-for-byte identical). The log prints one line per beat, e.g. `Hook: 2 cached, 1 synthesized；3 句，9.4s`.
+
+- Speed is not part of the raw-audio key: `speed` is a local atempo, and the sped-up audio is stored as a separate entry (keyed by the sha256 of the raw audio bytes + the full-precision repr of speed). Changing the speed re-joins the beat but doesn't call TTS again.
+- If the sentence audio and pauses (`silence_after` / `hold`) are the same as last time, `<beat>.wav` is not re-joined. Bookmark times that align wrote into timing.json are kept only if the sentence keys and bookmark positions are also unchanged; if you only moved a bookmark or renamed a bookmark or sentence id, the audio is reused but stale `marks` / `check` / `words` are cleared and you need to re-run align. `--force` re-joins anyway while still reading sentences from the cache; `--no-cache` calls TTS for every sentence and refreshes the cache.
+- Commands that write to an audio directory hold it exclusively for the whole run (`.cache/synth.lock`, flock, across processes): `synth` (reading and writing the cache, publishing wav / timing / provenance, writing the manifest and timing report), `align` (writing bookmarks back into timing.json), and `pitch --fix`. By default a second synth on the same directory prints `waiting for another synth on <dir>` and waits for the first to finish; with `--no-wait` it exits with an error immediately (exit code 2). The read-only `review` and `pitch` without `--fix` take no lock.
+- Publishing a beat goes in this order: atomically mark the beat as `pending` in the manifest (provenance unknown, not compliant) → pre-write `.cache/beats-next/<beat>.json` (this wav's sha256 + model / voice / speed) → swap in `<beat>.wav` → write timing.json → write `.cache/beats/<beat>.json` (also with the sha256, cues and provenance) → commit the actual provenance into the manifest. Provenance is part of the "unchanged, reuse it" fingerprint too. Every synth (and `pitch --fix`) starts by reconciling the manifest against the provenance files: whichever file's sha256 matches the current wav decides the record; if none matches and the record is pending / unknown, it is recorded as unknown. So an interruption at any step never lets the manifest call non-compliant audio compliant, and the next run (even one that only synthesizes other beats) repairs the record. Old directories without any provenance files keep their existing records. The manifest and timing report are replaced atomically.
+- A cache hit requires the index and format version to match, the object's sha256 to equal its file name, and the wav header to be valid with a matching frame count; otherwise (a write interrupted halfway, a truncated or modified file) the entry is treated as corrupt, reported, and the sentence is read again.
+- Audio objects are immutable: a file with a given name only ever has the same content, and an intact one is never rewritten. When `--no-cache` or `pitch --fix` refreshes a key, only a new object is written and the index is swapped atomically, so a reader that already got the old object still reads the complete old audio. The key of a sped-up entry is the sha256 of the raw audio bytes, and the bytes used for the key are the same ones fed to ffmpeg.
+- `lines/<beat>-<index>.wav` (+ `.json`) are copies for `align` re-checks and `pitch`, rewritten from the cache every time and no longer read as a cache. For directories synthesized before the upgrade: a copy whose provenance (text, instructions, voice, model) matches exactly is taken into the cache, with no new spending. `pitch --fix` can still reuse copies made before the persona text changed (checking only text, voice and model).
+- Old objects are never deleted automatically; deleting `.cache/` clears the cache. It is not part of the manifest and doesn't affect kit.
+
+Before synthesis, every narration sentence is first passed to [zh-math-reading](https://github.com/animind-ai/zh-math-reading): `$...$` formulas in `say` are expanded into their spoken readings (`$a_{n+1}^2$` → "a n 加一的平方"), and bookmark positions are computed on the expanded text; reading-risk hints are printed at the same time (a letter right after a colon, long sentences, polyphonic characters) — hints only, nothing is blocked. Sentences without formulas are byte-for-byte unchanged, so existing audio caches remain valid. zh-math-reading is an editable path dependency in a sibling directory and, like scene-spec, must be checked out alongside.
+
+`align` runs `whisper-large-v3-turbo` locally, with no online API needed. The backend is chosen automatically by platform: on macOS, [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple silicon, `--extra align`); on other platforms, [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, GPU with float16 if CUDA is available, `--extra align-cuda`). `--backend mlx|faster` or the environment variable `ANIMIND_ALIGN_BACKEND` forces a backend, `ANIMIND_ALIGN_DEVICE=cpu|cuda` sets the device, and with multiple GPUs use `CUDA_VISIBLE_DEVICES` to pick one. The two backends use different formats of the same model (`mlx-community/whisper-large-v3-turbo` / `mobiuslabsgmbh/faster-whisper-large-v3-turbo`), and bookmark times differ by about 0.1 s. How it works:
+
+1. Cut the beat audio at the sentence boundaries in timing.json and transcribe each sentence separately, with the script as the prompt;
+2. Whisper gives per-character timestamps, which are matched character by character against the script (numbers compared as Chinese characters, punctuation ignored);
+3. A bookmark takes the start time of the character it precedes; unmatched characters are interpolated between the nearest matched ones;
+4. Whisper occasionally cuts off in the middle of a multi-byte character, leaving later characters without timestamps; in that case, transcription resumes from the break point.
+
+Results are written back into timing.json:
+
+```json
+{"cues": [...], "total": 27.03,
+ "marks": {"s1": {"d0": 5.01}, "s2": {"d1": 8.04, "d2": 9.74, "d3": 12.0}},
+ "check": {"s1": {"ratio": 1.0, "missing": [], "extra": [], "heard": "..."}},
+ "aligner": "mlx-community/whisper-large-v3-turbo"}
+```
+
+When kit finds `marks`, it uses the real times; otherwise it estimates proportionally from character positions.
+
+Every hint meant for a human carries its position in the scene file; `t` is the sentence's start and end within the beat audio (the tool prints in Chinese: "书签 … 插值 … 请核对" = "bookmark … interpolated at … please check", "匹配 80%；没听到 …；多出 …；复核仍缺 …" = "match 80%; not heard …; extra …; still missing after re-check …"):
+
+```
+⚠ beats[2].say[1] (line 37, t=12.300-15.800): 书签 {@d1} 插值（interpolated）在 13.420s，请核对
+⚠ beats[2].say[1] (line 37, t=12.300-15.800): 匹配 80%；没听到 ['加回']；多出 []；复核仍缺 ['加回']
+```
+
+The line number points at the sentence's `text` (`en` with `--lang en`), taken from the start of the `yaml.compose` node, so scene-spec needs no changes.
+
+### Review
+
+`review` hands a finished episode to Gemini's video understanding (default `gemini-4-argon`, the flagship model for math and long videos as of 2026-10; change it with `--model` or the environment variable `GEMINI_REVIEW_MODEL`). The model watches the picture and listens to the sound at the same time, comparing them against the narration in the scene file, the bookmark times and the listen-back differences align recorded (attached only with `--spec` / `--audio`). Prompts live in `src/voice/prompts/review/v1/`; to change the wording, add a new version directory and select it with `--prompt-version`.
+
+Credentials work as for TTS: read only from `--env` or environment variables, never written to the repository and never printed:
+
+- `GEMINI_API_KEY`: the developer API. Long videos are uploaded through the Files API. If this key is present it is preferred.
+- Otherwise Vertex, the same setup as `synth`: `GOOGLE_CLOUD_PROJECT`, `GOOGLE_API_KEY`, with the region from `GOOGLE_CLOUD_REGION` (default `us-central1`).
+- `ANIMIND_REVIEW_BACKEND=gemini|vertex` forces one of the two.
+
+An OpenRouter-style name such as `google/gemini-4-argon` also works; review strips `google/` and goes through google.genai. Review does not use OpenRouter's audio endpoint.
+
+Videos shorter than `--max-chunk-seconds` (default 300 s) are watched in one pass, without re-encoding. Longer videos are cut with ffmpeg into overlapping windows (8 s overlap by default); each window is watched separately, timestamps are shifted back onto the whole episode, and issues of the same kind in an overlap are merged. A window up to 15 MB is uploaded inline; larger ones go through the Files API. Math frames default to `--media-resolution high` so formulas can be read. `--media-processing` defaults to `static` (about one frame per second, so layout problems are hard to miss); `agentic` uses fewer tokens and lets the model pick which parts to look at, but may miss overlaps and out-of-frame elements.
+
+Every HTTP call appends one line to `review_usage.jsonl` next to the report (cumulative, like `tts_usage.jsonl`). The cost in a report only adds up this run's in-memory calls; every log line carries a `run_id` and the shared log's last lines are never read back, so reviewing several episodes at once never counts someone else's cost. When the API returns token counts, those are used for pricing; if the stream breaks midway, the usage received so far is kept. If not a single token count arrives (or it is 0), the cost is roughly estimated from the text plus the video length and the record is marked `token_source: estimate`, never recorded as a confirmed 0. Prices are the standard tier, kept in `PRICES` in `src/voice/review.py` (checked against [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) on 2026-10-20):
+
+| Model | Input / output (USD per million tokens) | Price change |
+| --- | --- | --- |
+| `gemini-4-argon` (default) | 2 / 10 | 4 / 20 from 2026-12-01 |
+| `gemini-3.1-pro-preview` | 2 / 12; 4 / 18 when the prompt exceeds 200k tokens | — |
+| `gemini-3.8-flash` | 0.75 / 3.75 | 1.50 / 7.50 from 2027-01-01 |
+
+Models not in the table are priced as `gemini-4-argon`, with `price_known` false in the record. High-resolution static video is about 300 tokens/s (audio included) and low resolution about 100 tokens/s, so a 5-minute, single-pass, high-resolution request with about 1k output tokens costs roughly `90_000 × $2/1M + 1_000 × $10/1M ≈ $0.19` before 2026-11-30. Fifteen minutes cut into three windows is roughly three times that. These are estimates; `est_usd` in `review_usage.jsonl` is authoritative. Thinking tokens count as output.
+
+The report is written twice: the JSON at `--out`, and a short summary with the suffix changed to `.md`. If `--out` is a directory, the file name is `<video name>.review.json`. Exit codes are the ones a gate will use: 0 pass, 1 fail, 2 usage, credentials, or a model that keeps returning bad JSON. Bad JSON is sent back with the validation errors in the prompt and requested again, up to 3 times; 429 and 5xx are retried with exponential backoff, as many times as `--attempts` says.
+
+Default gate: any `major` or `blocker` fails; `minor` and `info` are only recorded. Pass a different JSON with `--thresholds`:
+
+```json
+{"fail_severities": ["blocker", "major"], "max_counts": {"minor": 8}, "fail_categories": {"math": "minor"}}
+```
+
+`fail_categories` gives the level from which a category counts as a failure (above: a math issue fails even at minor). `max_counts` caps the number of issues at a level; going over adds an `RV001`.
+
+The part of the JSON meant for pipelines is `gate`, shaped like the scene-spec checker's `Report.to_dict()`: `ok`, `issues` (`level` / `code` / `path` / `message`), `stats`. Only entries with `level` `error` make `ok` false; `path` is the issue's position in the scene file (see "Tracing back to the scene file" below), or `t=<start>-<end>` on the episode timeline when it can't be traced. `gate` is not an input to scene-spec's `check_timing`. `check_timing` takes `{beats: ...}` (narration and bookmark times); don't pass it `gate` or the whole review JSON. Stable codes:
+
+| Code | category | What it looks for |
+| --- | --- | --- |
+| RV100 | layout_overlap | text or shapes overlapping |
+| RV110 | out_of_frame | elements outside the frame |
+| RV120 | legibility | text too small |
+| RV200 | av_sync | picture and narration out of sync (including CUE LATE) |
+| RV210 | tts_pronunciation | swallowed or misread words, homophones (背/被) |
+| RV220 | tts_filler | fillers like 诶/嗯/哎 that aren't in the script |
+| RV230 | tts_voice_drift | sounds like a different person |
+| RV300 | pedagogy | skipped steps, picture contradicting the explanation |
+| RV310 | math | a formula or number is wrong |
+| RV400 | seam | looks like two episodes stitched together |
+| RV900 | other | anything else that would send the episode back |
+
+The top-level `ok` equals `gate.ok`. All fields are in `src/voice/prompts/review/v1/report.schema.json`.
+
+#### Tracing back to the scene file
+
+With `--spec`, every issue is mapped back to the scene file by its time `[start, end]` in the episode, adding `beat`, `sentence` (the sentence id, or its index if it has none), `line`, `column` and `path`, e.g. `beats[3].say[1] (line 22, t=15.200-15.400)`:
+
+- Each beat's start and end in the video come from the `<video>.chapters.json` kit writes next to it (or `--chapters`); a sentence's time within the beat comes from the timing.json under `--audio`, plus any sub-step holds before it (the chapters' `steps`, where the video holds still and silence is inserted into the narration).
+- An issue goes to the sentence whose time window it overlaps most; if it falls between two sentences, in a `pause`, or in a beat with no narration, it maps only to the beat (`line` is the line of that beat's `id`, `path` is `beats[i] (...)`); if it is in no beat it is left as is.
+- `beat` / `sentence` filled in by the model itself are always kept, and `line` / `path` point where the model said; if that disagrees with the timeline (or the scene has no such beat / sentence), it is noted in `trace_note`.
+- Without chapters.json, times are estimated from narration length only if every beat has a timing.json (kit's lower bound: narration + 0.28 s + `pause.hold`), which runs early when animation is longer than narration; `sources.timeline` says whether `chapters` or `estimated` was used. With neither, nothing is traced.
+
+Sentences with a match rate below 85%, or with more than two characters skipped / added, are flagged, for example in §6.7 episode 01 (the tool prints in Chinese: "匹配 95%；没听到 ['后面']；多出 []" = "match 95%; not heard ['后面']; extra []", "听到" = "heard"):
+
+```
+⚠ Problem[s4] 匹配 95%；没听到 ['后面']；多出 []
+  听到：然后告诉我们，数列 A n 是二、五、十一、二十一、三十六，省略，而且，……
+```
+
+### Development
+
+```bash
+uv run pytest      # no calls to TTS, Whisper or Gemini: synthesis uses a fake speak, alignment a fake transcriber, review recorded JSON
+ruff check .
+```
+
+### Author and license
+
+Author: Boxi Yu ([@BoxiYu](https://github.com/BoxiYu))
+
+The code is released under the [MIT License](LICENSE).
