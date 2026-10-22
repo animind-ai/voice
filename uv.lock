@@ -24,6 +24,9 @@ align = [
 align-cuda = [
     { name = "faster-whisper" },
 ]
+elevenlabs = [
+    { name = "elevenlabs" },
+]
 vertex = [
     { name = "google-genai" },
 ]
@@ -35,6 +38,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "elevenlabs", marker = "extra == 'elevenlabs'", specifier = ">=1.0" },
     { name = "faster-whisper", marker = "extra == 'align-cuda'", specifier = ">=1.1" },
     { name = "google-genai", marker = "extra == 'vertex'", specifier = ">=1.0" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'align'", specifier = ">=0.4" },
@@ -42,7 +46,7 @@ requires-dist = [
     { name = "scene-spec", editable = "../scene-spec" },
     { name = "zh-math-reading", editable = "../zh-math-reading" },
 ]
-provides-extras = ["align", "align-cuda", "vertex"]
+provides-extras = ["align", "align-cuda", "vertex", "elevenlabs"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]
@@ -323,6 +327,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/fc/f8/98eea607f65de6527f8a2e8885fc8015d3e6f5775df186e443e0964a11c3/distro-1.9.0.tar.gz", hash = "sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed", size = 60722, upload-time = "2023-12-24T09:54:32.31Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl", hash = "sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2", size = 20277, upload-time = "2023-12-24T09:54:30.421Z" },
+]
+
+[[package]]
+name = "elevenlabs"
+version = "2.74.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2e/03/b53b9d46dc6e682aa5595059d8035193405715613ad38eed69a1e609e047/elevenlabs-2.74.1.tar.gz", hash = "sha256:7f7159e8c079b753363b387b4e6a8c0d3b413df2adb435eec3befd4ea8f48e1f", size = 884448, upload-time = "2026-10-20T13:25:28.714Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/3b/100069b49ee9ae7eea63c57e97beb84143dcb607645e0357688ffe1674e2/elevenlabs-2.74.1-py3-none-any.whl", hash = "sha256:e94380ea301cb2324ec6daf05f0cf567ac9831454ca3f1fa7cfdb62d48705d27", size = 2320472, upload-time = "2026-10-20T13:25:26.301Z" },
 ]
 
 [[package]]

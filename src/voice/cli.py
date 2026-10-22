@@ -70,20 +70,23 @@ def main(argv: list[str] | None = None) -> int:
 
         synth.load_env(args.env)
         voice_style = doc.get("style", {}).get("voice", {})
-        model = args.model or os.environ.get("GEMINI_TTS_MODEL")
-        voice = args.voice or os.environ.get("GEMINI_TTS_VOICE")
+        model = args.model or synth.default_model()
+        voice = args.voice or synth.default_voice(model)
         if not model or not voice:
-            print("缺少 TTS 模型或声音：用 --model/--voice，或在 --env 文件里设 GEMINI_TTS_MODEL / GEMINI_TTS_VOICE", file=sys.stderr)
+            print("缺少 TTS 模型或声音：用 --model/--voice，或在 --env 文件里设 GEMINI_TTS_MODEL / GEMINI_TTS_VOICE"
+                  "（ElevenLabs：TTS_PROVIDER=elevenlabs、ELEVENLABS_VOICE_ID、ELEVENLABS_MODEL_ID）", file=sys.stderr)
             return 2
-        os.environ["GEMINI_TTS_VOICE"] = voice
+        os.environ["ELEVENLABS_VOICE_ID" if model.startswith("elevenlabs/") else "GEMINI_TTS_VOICE"] = voice
         speed = args.speed or float(voice_style.get("speed", 1.0))
         args.out.mkdir(parents=True, exist_ok=True)
         log_path = args.out / "tts_usage.jsonl"
-        before = synth.total_cost(log_path)
+        before, chars_before = synth.total_cost(log_path), synth.total_chars(log_path)
         for beat in beats:
             synth.synth_beat(beat, args.out, voice_style.get("persona", "teacher-hs"), model, voice, speed)
-        after = synth.total_cost(log_path)
+        after, chars_after = synth.total_cost(log_path), synth.total_chars(log_path)
         print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
+        if chars_after > chars_before:
+            print(f"其中按字符计费、单价未核的（ElevenLabs）：这次 {chars_after - chars_before} 字，累计 {chars_after} 字")
         return 0
 
     from . import align
@@ -143,7 +146,7 @@ def pitch_command(doc: dict, beats: list, args) -> int:
         if not names:
             continue
         _, voice, model, _ = rows[sorted(names)[0]]
-        os.environ["GEMINI_TTS_VOICE"] = voice
+        os.environ["ELEVENLABS_VOICE_ID" if model.startswith("elevenlabs/") else "GEMINI_TTS_VOICE"] = voice
         synth.synth_beat(beat, args.audio, persona, model, voice, speed, force=names, loose=True)
     after = synth.total_cost(log_path)
     fixed = measure()

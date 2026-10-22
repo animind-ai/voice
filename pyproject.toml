@@ -16,6 +16,7 @@ dependencies = [
 align = ["mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 align-cuda = ["faster-whisper>=1.1"]  # Linux / CUDA；1.1 起有 large-v3-turbo
 vertex = ["google-genai>=1.0"]
+elevenlabs = ["elevenlabs>=1.0"]  # 模型名 elevenlabs/<model_id>；声音和密钥只从环境变量读
 
 [project.scripts]
 animind-voice = "voice.cli:main"
