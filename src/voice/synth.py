@@ -2,6 +2,7 @@
 
 流程沿用 highSchool/lessons/sec6-7/kit/narrate.py：
 - 模型名带 "/"（例如 google/gemini-3.8-flash-tts）走 OpenRouter，风格提示放在 instructions；否则走 Vertex；
+  elevenlabs/<model_id>（例如 elevenlabs/eleven_v4）走 ElevenLabs，声音 ID 从 ELEVENLABS_VOICE_ID 读；
 - 句间静音按句末标点（scene_spec.silence_after，say[].hold 可覆盖），开头留 0.3 秒，最后一句之后不留；
 - speed ≠ 1 时用 ffmpeg atempo 只把人声变速（不变调，原声缓存不受影响），静音不随语速缩放，
   所以 timing.json 的 cues 之间的间隔就是 silence_after，scene_spec 的 SS487 能直接比。
@@ -131,8 +132,62 @@ def vertex_speak(instructions: str, text: str, model: str) -> bytes:
     raise RuntimeError("Gemini-TTS 没有返回音频")
 
 
+ELEVENLABS_PREFIX = "elevenlabs/"
+ELEVENLABS_DEFAULT_MODEL = "eleven_v4"
+
+
+def is_elevenlabs(model: str | None) -> bool:
+    return bool(model) and model.startswith(ELEVENLABS_PREFIX)
+
+
+def elevenlabs_speak(instructions: str, text: str, model: str) -> bytes:
+    """ElevenLabs（模型名写成 elevenlabs/<model_id>，例如 elevenlabs/eleven_v4）。
+
+    声音从环境变量 ELEVENLABS_VOICE_ID 读（复刻音色的 ID 不进仓库），ELEVENLABS_STABILITY /
+    ELEVENLABS_SIMILARITY_BOOST 可调；密钥 ELEVENLABS_API_KEY 由 SDK 自己从环境变量读。
+    v4 没有风格提示，instructions 不送，但仍记进缓存键（换人设会重合成，和其他提供方一样）。
+    返回 24 kHz 单声道 s16le PCM。需要 `uv sync --extra elevenlabs`。
+    """
+    from elevenlabs import ElevenLabs, VoiceSettings
+
+    lang = "en" if text.isascii() else "zh"
+    settings = VoiceSettings(stability=float(os.environ.get("ELEVENLABS_STABILITY", "0.5")),
+                             similarity_boost=float(os.environ.get("ELEVENLABS_SIMILARITY_BOOST", "0.75")))
+    client = ElevenLabs(timeout=180)
+    with client.text_to_speech.with_raw_response.convert(
+        text=text, voice_id=os.environ["ELEVENLABS_VOICE_ID"], model_id=model.removeprefix(ELEVENLABS_PREFIX),
+        language_code=lang, output_format="pcm_24000", voice_settings=settings,
+    ) as response:
+        audio = b"".join(response.data)
+    if not audio:
+        raise RuntimeError("ElevenLabs 没有返回音频")
+    return audio
+
+
 def default_speak(instructions: str, text: str, model: str) -> bytes:
+    if is_elevenlabs(model):
+        return elevenlabs_speak(instructions, text, model)
     return openrouter_speak(instructions, text, model) if "/" in model else vertex_speak(instructions, text, model)
+
+
+def voice_env(model: str) -> str:
+    """speak 函数从哪个环境变量读声音：ElevenLabs 是 ELEVENLABS_VOICE_ID，其余是 GEMINI_TTS_VOICE。"""
+    return "ELEVENLABS_VOICE_ID" if is_elevenlabs(model) else "GEMINI_TTS_VOICE"
+
+
+def default_model(environ=None) -> str | None:
+    """环境变量里的模型：TTS_PROVIDER=elevenlabs 时是 elevenlabs/<ELEVENLABS_MODEL_ID，默认 eleven_v4>，
+    否则 GEMINI_TTS_MODEL。"""
+    environ = os.environ if environ is None else environ
+    if environ.get("TTS_PROVIDER", "").strip().lower() == "elevenlabs":
+        return ELEVENLABS_PREFIX + (environ.get("ELEVENLABS_MODEL_ID") or ELEVENLABS_DEFAULT_MODEL)
+    return environ.get("GEMINI_TTS_MODEL")
+
+
+def default_voice(model: str | None, environ=None) -> str | None:
+    """环境变量里这个模型对应的声音：ElevenLabs 用 ELEVENLABS_VOICE_ID，其余用 GEMINI_TTS_VOICE。"""
+    environ = os.environ if environ is None else environ
+    return environ.get(voice_env(model or ""))
 
 
 def _to_wav(audio: bytes, out: Path) -> None:
@@ -239,7 +294,8 @@ def line_audio(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
         seconds = wav_seconds(tmp)
         cost = log_usage(lines_dir.parent / "tts_usage.jsonl", name, model, text, instructions, seconds)
         f0 = pitch.median_f0(tmp)
-        log(f"  合成 {name} {seconds:.1f}s，音高 {f0:.0f} Hz，约 ${cost:.4f}")
+        price = f"{len(text)} 字（单价未核）" if cost is None else f"约 ${cost:.4f}"
+        log(f"  合成 {name} {seconds:.1f}s，音高 {f0:.0f} Hz，{price}")
         if not pitch.off_voice(f0, voice):
             best = None
             break
@@ -264,29 +320,43 @@ def synth_line(lines_dir: Path, name: str, pace: str, text: str, persona: str, m
     return line_audio(lines_dir, name, pace, text, persona, model, voice, speak, log, force, loose, lang).view
 
 
-def estimate_cost(text: str, instructions: str, seconds: float) -> float:
+def estimate_cost(text: str, instructions: str, seconds: float, model: str = "") -> float | None:
+    """估算一次调用的费用（美元）。ElevenLabs 按字符计费、套餐单价各异：没设 ELEVENLABS_USD_PER_CHAR 时返回 None，
+    绝不套 Gemini 的价。"""
+    if is_elevenlabs(model):
+        rate = os.environ.get("ELEVENLABS_USD_PER_CHAR")
+        return len(text) * float(rate) if rate else None
     input_tokens = (len(text) + len(instructions)) * 1.5  # 粗估：中文约 1–2 token/字（英文按字母算偏高，宁多不少）
     return input_tokens * PRICE_INPUT_PER_TOKEN + seconds * AUDIO_TOKENS_PER_SECOND * PRICE_OUTPUT_PER_TOKEN
 
 
-def log_usage(path: Path, name: str, model: str, text: str, instructions: str, seconds: float) -> float:
-    """每次真实调用 TTS 追加一行用量记录，返回估算费用（美元）。"""
+def log_usage(path: Path, name: str, model: str, text: str, instructions: str, seconds: float) -> float | None:
+    """每次真实调用 TTS 追加一行用量记录，返回估算费用（美元；单价未知时记 null、返回 None，字数见 total_chars）。"""
     import datetime
 
-    cost = estimate_cost(text, instructions, seconds)
+    cost = estimate_cost(text, instructions, seconds, model)
     record = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "line": name, "model": model,
-              "chars": len(text), "seconds": round(seconds, 2), "est_usd": round(cost, 6)}
+              "chars": len(text), "seconds": round(seconds, 2), "est_usd": None if cost is None else round(cost, 6)}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     return cost
 
 
-def total_cost(path: Path) -> tuple[int, float]:
-    """用量记录里的调用次数和估算总费用。"""
+def _usage_rows(path: Path) -> list[dict]:
     if not path.exists():
-        return 0, 0.0
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return len(rows), sum(r.get("est_usd", 0.0) for r in rows)
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def total_cost(path: Path) -> tuple[int, float]:
+    """用量记录里的调用次数和估算总费用（单价未知、est_usd 为 null 的调用按 0 计，字数见 total_chars）。"""
+    rows = _usage_rows(path)
+    return len(rows), sum(r.get("est_usd") or 0.0 for r in rows)
+
+
+def total_chars(path: Path) -> int:
+    """单价未知（est_usd 为 null）的调用的字数之和：ElevenLabs 这类按字符计费的用它报用量。"""
+    return sum(r.get("chars", 0) for r in _usage_rows(path) if r.get("est_usd") is None)
 
 
 def synth_beat(beat: Beat, out_dir: Path, persona: str, model: str, voice: str, speed: float = 1.0,

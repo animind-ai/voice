@@ -41,7 +41,7 @@ Gemini TTS 偶尔会在单句里换成另一个性别的声音（同一个 `voic
 
 英文版：synth、align、pitch 都加 `--lang en`，念每句的 `en`（书签写在 `en` 里，见 scene-spec 设计稿 §7.7），用单独的音频目录。合成指令换成英文、Vertex 用 en-US，不过中文读法规则；对齐时 Whisper 按英文听写，听到的阿拉伯数字先拼成单词（2 → two）再和稿子配对。`review` 的 `--lang en` 只影响附给模型的场景稿。
 
-`synth` 的模型和声音从 `--env` 文件或环境变量读：`GEMINI_TTS_MODEL`（名字带 `/` 走 OpenRouter，需要 `OPENROUTER_API_KEY`；否则走 Vertex，需要 `uv sync --extra vertex` 和 `GOOGLE_*`）、`GEMINI_TTS_VOICE`。密钥从不打印，也不要放进仓库。人设取场景文件的 `style.voice.persona`，语速取 `style.voice.speed`（atempo 变速，不变调）。
+`synth` 的模型和声音从 `--env` 文件或环境变量读：`GEMINI_TTS_MODEL`（名字带 `/` 走 OpenRouter，需要 `OPENROUTER_API_KEY`；否则走 Vertex，需要 `uv sync --extra vertex` 和 `GOOGLE_*`）、`GEMINI_TTS_VOICE`。设 `TTS_PROVIDER=elevenlabs` 则改走 ElevenLabs（`uv sync --extra elevenlabs`）：模型 `elevenlabs/<ELEVENLABS_MODEL_ID>`（默认 `eleven_v4`），声音 `ELEVENLABS_VOICE_ID`，可调 `ELEVENLABS_STABILITY` / `ELEVENLABS_SIMILARITY_BOOST`，密钥 `ELEVENLABS_API_KEY`；按字符计费，用量记字数，`est_usd` 为 null（设 `ELEVENLABS_USD_PER_CHAR` 才估价）。密钥从不打印，也不要放进仓库。人设取场景文件的 `style.voice.persona`，语速取 `style.voice.speed`（atempo 变速，不变调）。
 
 #### 句级缓存
 
@@ -205,7 +205,7 @@ Gemini TTS occasionally switches to a voice of the other gender within a single 
 
 English version: add `--lang en` to synth, align and pitch to read each sentence's `en` (bookmarks are written inside `en`; see scene-spec design doc §7.7), using a separate audio directory. Synthesis instructions switch to English and Vertex uses en-US, skipping the Chinese reading rules; during alignment, Whisper transcribes in English, and heard Arabic numerals are first spelled out as words (2 → two) before matching against the script. For `review`, `--lang en` only changes which script is attached for the model.
 
-`synth` reads the model and voice from the `--env` file or environment variables: `GEMINI_TTS_MODEL` (a name containing `/` goes through OpenRouter and needs `OPENROUTER_API_KEY`; otherwise Vertex, which needs `uv sync --extra vertex` and `GOOGLE_*`), and `GEMINI_TTS_VOICE`. Keys are never printed and should never be put in the repository. The persona comes from the scene file's `style.voice.persona`, and the speed from `style.voice.speed` (atempo time-stretching, pitch unchanged).
+`synth` reads the model and voice from the `--env` file or environment variables: `GEMINI_TTS_MODEL` (a name containing `/` goes through OpenRouter and needs `OPENROUTER_API_KEY`; otherwise Vertex, which needs `uv sync --extra vertex` and `GOOGLE_*`), and `GEMINI_TTS_VOICE`. Setting `TTS_PROVIDER=elevenlabs` switches to ElevenLabs (`uv sync --extra elevenlabs`): model `elevenlabs/<ELEVENLABS_MODEL_ID>` (default `eleven_v4`), voice `ELEVENLABS_VOICE_ID`, optional `ELEVENLABS_STABILITY` / `ELEVENLABS_SIMILARITY_BOOST`, key `ELEVENLABS_API_KEY`; it bills per character, so usage is logged in characters with `est_usd: null` (set `ELEVENLABS_USD_PER_CHAR` to get an estimate). Keys are never printed and should never be put in the repository. The persona comes from the scene file's `style.voice.persona`, and the speed from `style.voice.speed` (atempo time-stretching, pitch unchanged).
 
 #### Sentence-level cache
 

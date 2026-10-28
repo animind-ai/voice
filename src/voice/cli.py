@@ -10,6 +10,7 @@ synth 读 scene-spec 的 say，先用 zh-math-reading 展开公式、打印读�
 每句的原声缓存在 <音频目录>/.cache/（只改一句只重念这一句，日志 "Hook: 2 cached, 1 synthesized"；--no-cache 全部重念），
 写出 manifest.json（实际用的 model / voice / speed）和 timing-report.json（给 scene-spec check --timing 用）。
 声音以场景的 style.voice 为准；--model/--voice/--speed 显式覆盖；GEMINI_TTS_* 环境变量只有 --allow-env-voice 或 VOICE_ALLOW_ENV_OVERRIDE=1 才采用；
+TTS_PROVIDER=elevenlabs 是显式选择 ElevenLabs：模型 elevenlabs/<ELEVENLABS_MODEL_ID>、声音 ELEVENLABS_VOICE_ID（按字数记用量，单价未核）；
 align 用 Whisper 求每个书签的真实时刻，写回 timing.json，并报告哪些句子需要回听。
 pitch 测每句的音高，找出像换了声音的句子；--fix 只重合成这些句子（同一段的其他句子沿用缓存），再重拼这一段。
 review 把成片（可带场景稿和 timing）交给 Gemini 看画面和声音，写出 JSON 报告和一份短 Markdown。退出码：0 通过，1 未通过，2 用法或调用失败。
@@ -39,7 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("synth", help="逐句合成旁白")
     s.add_argument("spec", type=Path)
     s.add_argument("--out", type=Path, required=True)
-    s.add_argument("--env", type=Path, help="含 OPENROUTER_API_KEY / GEMINI_TTS_* 的文件；不会打印其内容")
+    s.add_argument("--env", type=Path, help="含 OPENROUTER_API_KEY / GEMINI_TTS_*（或 TTS_PROVIDER=elevenlabs + ELEVENLABS_*）的文件；"
+                                            "不会打印其内容")
     s.add_argument("--model", help="覆盖场景 style.voice.model（会提示）；默认按场景，没写则 google/gemini-3.8-flash-tts")
     s.add_argument("--voice", help="覆盖场景 style.voice.voice（会提示）；默认按场景，没写则 Kore")
     s.add_argument("--speed", type=float, help="覆盖场景 style.voice.speed（会提示）；默认按场景，没写则 1.0")
@@ -142,15 +144,16 @@ def synth_command(doc: dict, all_beats: list, beats: list, args) -> int:
     if not choice.policy_ok:
         print(f"WARNING: 这批音频不符合发布政策（{'；'.join(choice.policy_problems())}）。"
               f"发布要求 {REQUIRED_MODEL}、{REQUIRED_VOICE}、语速 {REQUIRED_SPEED:g}；这批输出不可发布。", file=sys.stderr)
-    # speak 函数从 GEMINI_TTS_VOICE 读声音（OpenRouter 的 body / Vertex 的 voice_name），这里填入实际用的那个
-    os.environ["GEMINI_TTS_VOICE"] = choice.voice
+    # speak 函数从环境变量读声音（OpenRouter 的 body / Vertex 的 voice_name 读 GEMINI_TTS_VOICE，
+    # ElevenLabs 读 ELEVENLABS_VOICE_ID），这里填入实际用的那个
+    os.environ[synth.voice_env(choice.model)] = choice.voice
     args.out.mkdir(parents=True, exist_ok=True)
     log_path = args.out / "tts_usage.jsonl"
     persona = doc.get("style", {}).get("voice", {}).get("persona", "teacher-hs")
     # 整个运行独占音频目录：句子缓存、wav / timing / 说明、manifest、时间报告都只有这一个 synth 在写
     with _locked(args.out, args):
         _heal(args.out, {b.id for b in beats})  # 上次在发布途中被打断：按说明把 timing.json、说明、manifest 修好
-        before = synth.total_cost(log_path)
+        before, chars_before = synth.total_cost(log_path), synth.total_chars(log_path)
         for beat in beats:
             # 换 wav 之前先在 manifest 里把这一段记成 pending（不合规），发布完再提交实际来源
             synth.synth_beat(beat, args.out, persona, choice.model, choice.voice, choice.speed,
@@ -158,7 +161,7 @@ def synth_command(doc: dict, all_beats: list, beats: list, args) -> int:
                              before_publish=lambda b=beat.id: policy.mark_pending(args.out, b, args.lang, choice.sources))
             if (args.out / f"{beat.id}.timing.json").exists():
                 policy.write_manifest(args.out, choice, args.lang, [beat.id])
-        after = synth.total_cost(log_path)
+        after, chars_after = synth.total_cost(log_path), synth.total_chars(log_path)
         done = [b.id for b in beats if (args.out / f"{b.id}.timing.json").exists()]
         conflicts = policy.write_manifest(args.out, choice, args.lang, done)  # 提醒按最终状态给
         report = timing_report.write(all_beats, args.out)  # 对不上 wav 的 beat 不收（见 timing_report.py）
@@ -166,6 +169,8 @@ def synth_command(doc: dict, all_beats: list, beats: list, args) -> int:
     for conflict in conflicts:
         print(f"WARNING: {args.out}：{conflict}", file=sys.stderr)
     print(f"这次调用 TTS {after[0] - before[0]} 次，约 ${after[1] - before[1]:.4f}；累计 {after[0]} 次，约 ${after[1]:.4f}（{log_path}）")
+    if chars_after > chars_before:
+        print(f"其中按字符计费、单价未核的（ElevenLabs）：这次 {chars_after - chars_before} 字，累计 {chars_after} 字")
     print(f"模型 {choice.model}，声音 {choice.voice}，语速 {choice.speed:g}；时间报告 {report}")
     if broken:
         print(f"错误：{args.out} 里这些 beat 的音频和 timing.json / 发布说明对不上，没写进时间报告：{'、'.join(broken)}。"
@@ -313,7 +318,7 @@ def _pitch(doc: dict, beats: list, args) -> int:
         if not names:
             continue
         _, voice, model, _ = rows[sorted(names)[0]]
-        os.environ["GEMINI_TTS_VOICE"] = voice
+        os.environ[synth.voice_env(model)] = voice
         # 重合成要用这个 beat 当初实际的语速，不是场景里写的
         speed = policy.beat_speed(args.audio, beat.id, default_speed)
         synth.synth_beat(beat, args.audio, persona, model, voice, speed, force=names, loose=True,

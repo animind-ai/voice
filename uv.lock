@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11, <3.13"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -25,6 +25,9 @@ align = [
 align-cuda = [
     { name = "faster-whisper" },
 ]
+elevenlabs = [
+    { name = "elevenlabs" },
+]
 review = [
     { name = "google-genai" },
 ]
@@ -39,6 +42,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "elevenlabs", marker = "extra == 'elevenlabs'", specifier = ">=1.0" },
     { name = "faster-whisper", marker = "extra == 'align-cuda'", specifier = ">=1.1" },
     { name = "google-genai", marker = "extra == 'review'", specifier = ">=1.0" },
     { name = "google-genai", marker = "extra == 'vertex'", specifier = ">=1.0" },
@@ -48,7 +52,7 @@ requires-dist = [
     { name = "scene-spec", editable = "../scene-spec" },
     { name = "zh-math-reading", editable = "../zh-math-reading" },
 ]
-provides-extras = ["align", "align-cuda", "vertex", "review"]
+provides-extras = ["align", "align-cuda", "vertex", "review", "elevenlabs"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]
@@ -332,6 +336,23 @@ wheels = [
 ]
 
 [[package]]
+name = "elevenlabs"
+version = "2.75.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c6/d4/a1266c9f4f570de9afd050d5aed4fa67be583ab856175bfc3ee2dc1773a5/elevenlabs-2.75.0.tar.gz", hash = "sha256:156358da7060abcd212d1f863137931218061209d4fc4e3be0787ed72f1dc27b", size = 889084, upload-time = "2026-10-28T09:34:05.592Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/cb/f63a2375ea0e461f665ce2d912c55a12833f5db778042ed2a562a64c20b9/elevenlabs-2.75.0-py3-none-any.whl", hash = "sha256:28c4eefc4e5e1c9766906035e54a0c84449b7c4fd3b2e5157ba704b6f22089a4", size = 2329611, upload-time = "2026-10-28T09:34:03.211Z" },
+]
+
+[[package]]
 name = "faster-whisper"
 version = "1.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -607,7 +628,7 @@ name = "mlx"
 version = "0.32.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mlx-metal" },
+    { name = "mlx-metal", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7b/fd/f7af63951d6f4d39b47bbda462f2ed0341ce1293967de36ce9bbd4b836a9/mlx-0.32.4-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:dd0c9070d9c362fe280a0224806b1b47719b154984735041ebcc907e597c08ca", size = 671764, upload-time = "2026-10-14T21:15:48.321Z" },
@@ -1084,7 +1105,7 @@ wheels = [
 
 [[package]]
 name = "scene-spec"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "../scene-spec" }
 dependencies = [
     { name = "jsonschema" },
@@ -1108,7 +1129,7 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7a/97/5a3609c4f8d58b039179648e62dd220f89864f56f7357f5d4f45c29eb2cc/scipy-1.17.1.tar.gz", hash = "sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0", size = 30573822, upload-time = "2026-02-23T00:26:24.851Z" }
 wheels = [
@@ -1126,7 +1147,7 @@ resolution-markers = [
     "python_full_version >= '3.12'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7e/74/66de6258867beb2ef08f35f9f2ac017a52cacd5081714d239ff1a442d458/scipy-1.18.1.tar.gz", hash = "sha256:52c4b7422442aba924d03ad4019852b08a92e64ea187b933135687bfe2747307", size = 30781235, upload-time = "2026-08-21T23:28:50.599Z" }
 wheels = [

@@ -3,6 +3,8 @@
 优先级（高到低）：
 1. 命令行 --model / --voice / --speed（显式覆盖，打印一条提示）；
 2. 环境变量 GEMINI_TTS_MODEL / GEMINI_TTS_VOICE，只有 --allow-env-voice 或 VOICE_ALLOW_ENV_OVERRIDE=1 时才采用，并打印大声警告；
+   TTS_PROVIDER=elevenlabs 本身就是显式选择：模型取 elevenlabs/<ELEVENLABS_MODEL_ID，默认 eleven_v4>、
+   声音取 ELEVENLABS_VOICE_ID（复刻音色的 ID 只放在环境里，场景文件里没有），同样打印大声警告；
 3. 场景 style.voice 里写的值；
 4. 场景没写时的默认值：google/gemini-3.8-flash-tts、Kore、语速 1.0。
 
@@ -20,11 +22,13 @@ from pathlib import Path
 
 from scene_spec.quality import REQUIRED_MODEL, REQUIRED_SPEED, REQUIRED_VOICE
 
+from .synth import default_model, is_elevenlabs, voice_env
 from .ttscache import beats_dir, next_dir, sha256_file, write_text_atomic
 
 ENV_MODEL = "GEMINI_TTS_MODEL"
 ENV_VOICE = "GEMINI_TTS_VOICE"
 ENV_ALLOW = "VOICE_ALLOW_ENV_OVERRIDE"
+ENV_PROVIDER = "TTS_PROVIDER"
 
 
 @dataclass(frozen=True)
@@ -72,8 +76,12 @@ def resolve(doc: dict, *, model: str | None = None, voice: str | None = None, sp
 
     notices, warnings = [], []
     env_allowed = env_override_allowed(environ, allow_env)
-    for key, env_name in (("model", ENV_MODEL), ("voice", ENV_VOICE)):
-        env_value = environ.get(env_name)
+    env_pairs = (("model", ENV_MODEL), ("voice", ENV_VOICE))
+    if is_elevenlabs(default_model(environ)):  # TTS_PROVIDER=elevenlabs：显式选了提供方，不用再 --allow-env-voice
+        env_allowed = True
+        env_pairs = (("model", ENV_PROVIDER), ("voice", voice_env(default_model(environ))))
+    for key, env_name in env_pairs:
+        env_value = default_model(environ) if env_name == ENV_PROVIDER else environ.get(env_name)
         if not env_value:
             continue
         if env_allowed:
@@ -90,6 +98,12 @@ def resolve(doc: dict, *, model: str | None = None, voice: str | None = None, sp
             notices.append(f"命令行 --{key} 覆盖 {values[key]!r}，改用 {flag_value!r}")
         values[key], sources[key] = flag_value, "flag"
 
+    # 换成了 ElevenLabs 模型、声音却还是默认的 Gemini 声音名：改取 ELEVENLABS_VOICE_ID（没有就报错，Kore 不是 ElevenLabs 的声音）
+    if is_elevenlabs(values["model"]) and sources["voice"] == "default":
+        env_voice = environ.get(voice_env(values["model"]))
+        if not env_voice:
+            raise ValueError(f"模型 {values['model']} 需要声音 ID：设 ELEVENLABS_VOICE_ID 或用 --voice")
+        values["voice"], sources["voice"] = env_voice, "env"
     _check_values(values)
     return VoiceChoice(values["model"], values["voice"], float(values["speed"]), sources, notices, warnings)
 
